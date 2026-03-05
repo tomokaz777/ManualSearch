@@ -5,5 +5,7 @@ langchain-openai
 langchain-huggingface
 sentence-transformers
 pypdf
+cryptography
+pycryptodome
 python-dotenv
 streamlit
