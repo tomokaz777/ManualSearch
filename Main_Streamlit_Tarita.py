@@ -1,10 +1,14 @@
 import hashlib
+import io
 import json
+import os
 import base64
+import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+import requests
 import streamlit as st
 
 import app
@@ -76,6 +80,129 @@ def _sha256_bytes(data: bytes) -> str:
 
 def _normalize_key(name: str) -> str:
     return name.replace("\\", "/")
+
+
+# ── GitHub Releases 連携 ──────────────────────────────────────────────────────
+
+_GITHUB_RELEASE_TAG = "index-backup"
+
+
+def _get_github_secret(key: str) -> str:
+    """環境変数 → Streamlit secrets の順で取得する。"""
+    val = os.getenv(key, "")
+    if not val:
+        try:
+            val = st.secrets.get(key, "")
+        except Exception:
+            pass
+    return str(val or "")
+
+
+def _github_headers() -> Dict:
+    token = _get_github_secret("GITHUB_TOKEN")
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _zip_chroma_dir() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in app.CHROMA_DIR.rglob("*"):
+            if f.is_file():
+                zf.write(f, f.relative_to(app.CHROMA_DIR))
+    return buf.getvalue()
+
+
+def save_index_to_github() -> Tuple[bool, str]:
+    """chroma_db を zip して GitHub Releases に保存する。"""
+    token = _get_github_secret("GITHUB_TOKEN")
+    repo = _get_github_secret("GITHUB_REPO")
+    if not token or not repo:
+        return False, "GITHUB_TOKEN または GITHUB_REPO が未設定です"
+
+    hdrs = _github_headers()
+    base = f"https://api.github.com/repos/{repo}"
+
+    # 既存リリースを削除
+    r = requests.get(f"{base}/releases/tags/{_GITHUB_RELEASE_TAG}", headers=hdrs, timeout=30)
+    if r.status_code == 200:
+        requests.delete(f"{base}/releases/{r.json()['id']}", headers=hdrs, timeout=30)
+    requests.delete(f"{base}/git/refs/tags/{_GITHUB_RELEASE_TAG}", headers=hdrs, timeout=30)
+
+    # 新規リリース作成
+    r = requests.post(
+        f"{base}/releases",
+        json={
+            "tag_name": _GITHUB_RELEASE_TAG,
+            "name": "Search Index Backup",
+            "body": f"更新日時: {_utc_now_iso()}",
+            "prerelease": True,
+        },
+        headers=hdrs,
+        timeout=30,
+    )
+    if r.status_code != 201:
+        return False, f"リリース作成失敗 ({r.status_code})"
+
+    upload_url = r.json()["upload_url"].split("{")[0]
+
+    # zip 作成 & アップロード
+    zip_data = _zip_chroma_dir()
+    upload_hdrs = {"Authorization": f"Bearer {token}", "Content-Type": "application/zip"}
+    r = requests.post(
+        f"{upload_url}?name=chroma_db.zip",
+        data=zip_data,
+        headers=upload_hdrs,
+        timeout=180,
+    )
+    if r.status_code != 201:
+        return False, f"アップロード失敗 ({r.status_code})"
+
+    return True, f"保存完了 ({len(zip_data) // 1024} KB)"
+
+
+def load_index_from_github() -> Tuple[bool, str]:
+    """GitHub Releases から chroma_db を復元する。"""
+    token = _get_github_secret("GITHUB_TOKEN")
+    repo = _get_github_secret("GITHUB_REPO")
+    if not token or not repo:
+        return False, "GITHUB_TOKEN または GITHUB_REPO が未設定です"
+
+    hdrs = _github_headers()
+    base = f"https://api.github.com/repos/{repo}"
+
+    # リリース取得
+    r = requests.get(f"{base}/releases/tags/{_GITHUB_RELEASE_TAG}", headers=hdrs, timeout=30)
+    if r.status_code != 200:
+        return False, "保存済みインデックスが見つかりません"
+
+    asset = next((a for a in r.json().get("assets", []) if a["name"] == "chroma_db.zip"), None)
+    if not asset:
+        return False, "chroma_db.zip が見つかりません"
+
+    # アセットをダウンロード（認証付き）
+    dl_hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/octet-stream"}
+    r = requests.get(
+        f"{base}/releases/assets/{asset['id']}",
+        headers=dl_hdrs,
+        allow_redirects=True,
+        timeout=180,
+    )
+    if r.status_code != 200:
+        return False, f"ダウンロード失敗 ({r.status_code})"
+
+    # 展開
+    app.CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        zf.extractall(app.CHROMA_DIR)
+
+    return True, f"復元完了 ({len(r.content) // 1024} KB)"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _upsert_pdf(
@@ -412,6 +539,16 @@ def main() -> None:
         st.session_state["runtime_chroma_dir"],
     )
 
+    # 起動時に chroma_db が空なら GitHub から自動復元
+    if "_auto_restore_done" not in st.session_state:
+        st.session_state["_auto_restore_done"] = True
+        if _get_github_secret("GITHUB_TOKEN"):
+            has_index = any(app.CHROMA_DIR.rglob("*.sqlite3"))
+            if not has_index:
+                with st.spinner("GitHubからインデックスを自動復元中..."):
+                    ok, msg = load_index_from_github()
+                st.toast(f"✅ {msg}" if ok else f"⚠️ {msg}")
+
     tab_ingest, tab_query, tab_manage = st.tabs(["取り込み", "検索", "管理"])
 
     with tab_ingest:
@@ -603,6 +740,29 @@ def main() -> None:
                 except Exception as e:
                     st.error(f"add実行に失敗しました: {e}")
 
+        st.divider()
+        st.subheader("GitHubインデックス同期")
+        st.caption("取り込み完了後に「GitHubに保存」を押すと、次回起動時も自動でインデックスが復元されます。")
+        sync_col1, sync_col2 = st.columns(2)
+        with sync_col1:
+            if st.button("💾 GitHubに保存", use_container_width=True):
+                with st.spinner("GitHubに保存中..."):
+                    ok, msg = save_index_to_github()
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
+        with sync_col2:
+            if st.button("⬇️ GitHubから復元", use_container_width=True):
+                with st.spinner("GitHubから復元中..."):
+                    ok, msg = load_index_from_github()
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+        st.divider()
         manifest = app.load_manifest()
         names = sorted(manifest.get("files", {}).keys())
         st.write(f"登録ファイル数: {len(names)}")
