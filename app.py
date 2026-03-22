@@ -39,7 +39,7 @@ EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "local").lower()
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 LOCAL_EMBEDDING_MODEL = os.getenv(
     "LOCAL_EMBEDDING_MODEL",
-    "intfloat/multilingual-e5-large",
+    "intfloat/multilingual-e5-small",
 )
 
 USE_OPENAI_CHAT = os.getenv("USE_OPENAI_CHAT", "false").lower() == "true"
