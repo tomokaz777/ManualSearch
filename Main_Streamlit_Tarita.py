@@ -82,6 +82,16 @@ def _normalize_key(name: str) -> str:
     return name.replace("\\", "/")
 
 
+def _uploaded_size(uploaded_file) -> int:
+    size = getattr(uploaded_file, "size", None)
+    if size is not None:
+        return int(size)
+    try:
+        return len(uploaded_file.getbuffer())
+    except Exception:
+        return len(uploaded_file.getvalue() or b"")
+
+
 # ── GitHub Releases 連携 ──────────────────────────────────────────────────────
 
 _GITHUB_RELEASE_TAG = "index-backup"
@@ -256,7 +266,7 @@ def _upsert_pdf(
 def index_uploaded_pdfs(
     uploaded_files,
     progress_cb: Optional[Callable[[float, str, int, int, int], None]] = None,
-) -> Tuple[int, int, int]:
+) -> Tuple[int, int, int, List[str]]:
     total = max(len(uploaded_files), 1)
 
     def emit(progress: float, text: str, t: int, a: int, r: int) -> None:
@@ -276,48 +286,63 @@ def index_uploaded_pdfs(
     touched = 0
     added = 0
     removed = 0
+    errors: List[str] = []
 
     for idx, uploaded in enumerate(uploaded_files, start=1):
         file_start = 0.15 + 0.8 * ((idx - 1) / total)
         file_span = 0.8 / total
         emit(file_start, f"{uploaded.name}: 取り込み準備中...", touched, added, removed)
-        data = uploaded.getvalue()
-        if not data:
-            emit(file_start + file_span, f"{uploaded.name}: 空ファイルのためスキップ", touched, added, removed)
-            continue
-        save_path = upload_cache_dir / uploaded.name
-        save_path.write_bytes(data)
+        try:
+            save_path = upload_cache_dir / uploaded.name
+            data_view = None
+            try:
+                data_view = uploaded.getbuffer()
+                if len(data_view) == 0:
+                    emit(file_start + file_span, f"{uploaded.name}: 空ファイルのためスキップ", touched, added, removed)
+                    continue
+                save_path.write_bytes(data_view)
+                file_hash = hashlib.sha256(data_view).hexdigest()
+            finally:
+                if data_view is not None:
+                    try:
+                        data_view.release()
+                    except Exception:
+                        pass
 
-        logical_name = f"streamlit_uploads/{uploaded.name}"
-        stage_ratio = {
-            "既存チャンクを削除中...": 0.20,
-            "PDFテキスト抽出中...": 0.45,
-            "チャンク分割中...": 0.70,
-            "ベクトル化してChromaへ保存中...": 0.90,
-        }
+            logical_name = f"streamlit_uploads/{uploaded.name}"
+            stage_ratio = {
+                "既存チャンクを削除中...": 0.20,
+                "PDFテキスト抽出中...": 0.45,
+                "チャンク分割中...": 0.70,
+                "ベクトル化してChromaへ保存中...": 0.90,
+            }
 
-        def on_stage(msg: str, name: str = uploaded.name) -> None:
-            ratio = stage_ratio.get(msg, 0.5)
-            emit(file_start + file_span * ratio, f"{name}: {msg}", touched, added, removed)
+            def on_stage(msg: str, name: str = uploaded.name) -> None:
+                ratio = stage_ratio.get(msg, 0.5)
+                emit(file_start + file_span * ratio, f"{name}: {msg}", touched, added, removed)
 
-        changed, a, r = _upsert_pdf(
-            logical_file_name=logical_name,
-            file_path=save_path,
-            file_hash=_sha256_bytes(data),
-            store=store,
-            manifest_files=manifest_files,
-            stage_cb=on_stage if progress_cb else None,
-        )
-        if changed:
-            touched += 1
-            added += a
-            removed += r
-        emit(file_start + file_span, f"{uploaded.name}: 完了", touched, added, removed)
+            changed, a, r = _upsert_pdf(
+                logical_file_name=logical_name,
+                file_path=save_path,
+                file_hash=file_hash,
+                store=store,
+                manifest_files=manifest_files,
+                stage_cb=on_stage if progress_cb else None,
+            )
+            if changed:
+                touched += 1
+                added += a
+                removed += r
+            emit(file_start + file_span, f"{uploaded.name}: 完了", touched, added, removed)
+        except Exception as e:
+            errors.append(f"{uploaded.name}: {e}")
+            emit(file_start + file_span, f"{uploaded.name}: エラーのためスキップ", touched, added, removed)
 
     emit(0.97, "結果保存中...", touched, added, removed)
     app.save_manifest(manifest)
-    emit(1.0, "取り込み完了", touched, added, removed)
-    return touched, added, removed
+    final_text = "取り込み完了" if not errors else f"取り込み完了（一部エラー {len(errors)} 件）"
+    emit(1.0, final_text, touched, added, removed)
+    return touched, added, removed, errors
 
 
 def _uploaded_signature(uploaded_files) -> str:
@@ -325,8 +350,7 @@ def _uploaded_signature(uploaded_files) -> str:
         return ""
     parts = []
     for f in uploaded_files:
-        size = len(f.getvalue() or b"")
-        parts.append(f"{f.name}:{size}")
+        parts.append(f"{f.name}:{_uploaded_size(f)}")
     return "|".join(sorted(parts))
 
 
@@ -565,10 +589,13 @@ def main() -> None:
         )
         if uploaded_files:
             st.info(f"アップロード済み: {len(uploaded_files)} 件")
+            total_size_mb = sum(_uploaded_size(f) for f in uploaded_files) / (1024 * 1024)
+            st.caption(f"合計サイズ: {total_size_mb:.1f} MB")
             with st.expander("アップロードファイル一覧", expanded=False):
                 for f in uploaded_files:
                     st.write(f"- {f.name}")
         else:
+            st.session_state.pop("last_upload_signature", None)
             st.caption("PDFをドロップ後、ボタン押下または自動取り込みで開始します。")
 
         def run_uploaded_indexing() -> None:
@@ -586,12 +613,25 @@ def main() -> None:
                 status.info(f"更新ファイル={t} / 追加チャンク={a} / 置換削除チャンク={r}")
                 stage_log.caption(f"現在の工程: {message}")
 
-            touched, added, removed = index_uploaded_pdfs(uploaded_files, progress_cb=on_upload_progress)
-            progress.progress(100, text="取り込み完了")
+            try:
+                touched, added, removed, errors = index_uploaded_pdfs(
+                    uploaded_files,
+                    progress_cb=on_upload_progress,
+                )
+            except Exception as e:
+                status.empty()
+                st.error(f"アップロード取り込みに失敗しました: {e}")
+                return
+
+            completion_text = "取り込み完了" if not errors else "取り込み完了（一部エラーあり）"
+            progress.progress(100, text=completion_text)
             status.empty()
-            st.success(
-                f"完了: 更新ファイル={touched}, 追加チャンク={added}, 置換削除チャンク={removed}"
-            )
+            st.success(f"完了: 更新ファイル={touched}, 追加チャンク={added}, 置換削除チャンク={removed}")
+            if errors:
+                st.warning(f"失敗ファイル: {len(errors)} 件")
+                with st.expander("失敗ファイル一覧", expanded=False):
+                    for msg in errors:
+                        st.write(f"- {msg}")
 
         if st.button("アップロードPDFをインデックス", use_container_width=True):
             if not uploaded_files:
@@ -600,13 +640,20 @@ def main() -> None:
                 run_uploaded_indexing()
 
         if auto_upload_index and uploaded_files:
-            sig = _uploaded_signature(uploaded_files)
-            if st.session_state.get("last_upload_signature") != sig:
-                st.session_state["last_upload_signature"] = sig
-                st.toast("アップロードを検出。自動取り込みを開始します。")
-                run_uploaded_indexing()
+            if len(uploaded_files) > 1:
+                st.info(
+                    "複数ファイル一括アップロード時は、自動取り込みを止めています。"
+                    " Streamlit Cloud では再実行が重なりやすいため、"
+                    " アップロード完了後に手動ボタンで開始してください。"
+                )
             else:
-                st.caption("同一ファイル構成のため自動再実行はスキップ中です。必要なら手動ボタンを押してください。")
+                sig = _uploaded_signature(uploaded_files)
+                if st.session_state.get("last_upload_signature") != sig:
+                    st.session_state["last_upload_signature"] = sig
+                    st.toast("アップロードを検出。自動取り込みを開始します。")
+                    run_uploaded_indexing()
+                else:
+                    st.caption("同一ファイル構成のため自動再実行はスキップ中です。必要なら手動ボタンを押してください。")
 
         st.divider()
         st.subheader("2) フォルダ指定でPDF一括取り込み")

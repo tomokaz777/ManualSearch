@@ -7,6 +7,7 @@ import re
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -109,14 +110,19 @@ def save_manifest(manifest: Dict) -> None:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
 
 
-def get_embeddings():
-    if EMBEDDING_BACKEND == "openai":
-        return OpenAIEmbeddings(model=OPENAI_EMBEDDING_MODEL)
-    if EMBEDDING_BACKEND == "local":
+@lru_cache(maxsize=8)
+def _build_embeddings(
+    embedding_backend: str,
+    openai_embedding_model: str,
+    local_embedding_model: str,
+) -> Embeddings:
+    if embedding_backend == "openai":
+        return OpenAIEmbeddings(model=openai_embedding_model)
+    if embedding_backend == "local":
         # Fallback chain: if the configured local model is broken/corrupted in cache,
         # try smaller multilingual models to keep the app usable.
         candidate_models = [
-            LOCAL_EMBEDDING_MODEL,
+            local_embedding_model,
             "intfloat/multilingual-e5-base",
             "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         ]
@@ -142,6 +148,14 @@ def get_embeddings():
         )
     raise ValueError(
         "Invalid EMBEDDING_BACKEND. Use 'openai' or 'local'."
+    )
+
+
+def get_embeddings():
+    return _build_embeddings(
+        EMBEDDING_BACKEND,
+        OPENAI_EMBEDDING_MODEL,
+        LOCAL_EMBEDDING_MODEL,
     )
 
 
