@@ -631,12 +631,20 @@ def main() -> None:
     st.title("Manual PDF RAG (Chroma Persistent)")
     st.caption("PDFをドラッグ&ドロップ、またはフォルダ指定で一括インデックスできます。")
     st.sidebar.header("対象言語")
-    active_language_label = st.sidebar.radio(
+    language_options = ["選択してください"] + [label for label, _ in LANGUAGE_OPTIONS]
+    active_language_label = st.sidebar.selectbox(
         "コーパスを選択",
-        options=[label for label, _ in LANGUAGE_OPTIONS],
+        options=language_options,
         index=0,
         key="active_language_label",
     )
+    admin_mode = st.sidebar.checkbox("管理者モード", value=False, key="admin_mode")
+    st.sidebar.caption("Off: 検索のみ / On: 取り込み・検索・管理")
+
+    if active_language_label == "選択してください":
+        st.info("サイドバーで対象言語を選択するとメインメニューを表示します。")
+        return
+
     active_language_code = LANGUAGE_LABEL_TO_CODE[active_language_label]
     st.sidebar.caption("選択した言語ごとに、取り込み・検索・管理・登録ファイル一覧を分けて扱います。")
 
@@ -661,102 +669,43 @@ def main() -> None:
                     ok, msg = load_index_from_github()
                 st.toast(f"✅ {msg}" if ok else f"⚠️ {msg}")
 
-    tab_ingest, tab_query, tab_manage = st.tabs(["取り込み", "検索", "管理"])
+    if admin_mode:
+        tab_ingest, tab_query, tab_manage = st.tabs(["取り込み", "検索", "管理"])
+    else:
+        tab_query = st.tabs(["検索"])[0]
 
-    with tab_ingest:
-        st.subheader("1) PDFドラッグ&ドロップ取り込み")
-        st.caption(f"現在の対象言語: {active_language_label}")
-        auto_upload_index = st.checkbox(
-            "アップロード後に自動で取り込み開始",
-            value=True,
-            help="ONの場合、ドラッグ&ドロップ直後にインデックス処理を開始します。",
-        )
-        uploaded_files = st.file_uploader(
-            "PDFを複数選択またはドラッグ&ドロップ",
-            type=["pdf"],
-            accept_multiple_files=True,
-        )
-        if uploaded_files:
-            st.info(f"アップロード済み: {len(uploaded_files)} 件")
-            total_size_mb = sum(_uploaded_size(f) for f in uploaded_files) / (1024 * 1024)
-            st.caption(f"合計サイズ: {total_size_mb:.1f} MB")
-            with st.expander("アップロードファイル一覧", expanded=False):
-                for f in uploaded_files:
-                    st.write(f"- {f.name}")
-        else:
-            st.session_state.pop("last_upload_signature", None)
-            st.caption("PDFをドロップ後、ボタン押下または自動取り込みで開始します。")
-
-        def run_uploaded_indexing() -> None:
-            progress = st.progress(0, text="取り込みを開始します...")
-            status = st.empty()
-            stage_log = st.empty()
-            st.caption("初回は埋め込みモデルのロードで時間がかかる場合があります。")
-
-            def on_upload_progress(ratio01: float, message: str, t: int, a: int, r: int) -> None:
-                ratio = int(ratio01 * 100)
-                progress.progress(
-                    ratio,
-                    text=f"処理中 {ratio}%: {message}",
-                )
-                status.info(f"更新ファイル={t} / 追加チャンク={a} / 置換削除チャンク={r}")
-                stage_log.caption(f"現在の工程: {message}")
-
-            try:
-                touched, added, removed, errors = index_uploaded_pdfs(
-                    uploaded_files,
-                    progress_cb=on_upload_progress,
-                )
-            except Exception as e:
-                status.empty()
-                st.error(f"アップロード取り込みに失敗しました: {e}")
-                return
-
-            completion_text = "取り込み完了" if not errors else "取り込み完了（一部エラーあり）"
-            progress.progress(100, text=completion_text)
-            status.empty()
-            st.success(f"完了: 更新ファイル={touched}, 追加チャンク={added}, 置換削除チャンク={removed}")
-            if errors:
-                st.warning(f"失敗ファイル: {len(errors)} 件")
-                with st.expander("失敗ファイル一覧", expanded=False):
-                    for msg in errors:
-                        st.write(f"- {msg}")
-
-        if st.button("アップロードPDFをインデックス", use_container_width=True):
-            if not uploaded_files:
-                st.warning("PDFが選択されていません。")
+    if admin_mode:
+        with tab_ingest:
+            st.subheader("1) PDFドラッグ&ドロップ取り込み")
+            st.caption(f"現在の対象言語: {active_language_label}")
+            auto_upload_index = st.checkbox(
+                "アップロード後に自動で取り込み開始",
+                value=True,
+                help="ONの場合、ドラッグ&ドロップ直後にインデックス処理を開始します。",
+            )
+            uploaded_files = st.file_uploader(
+                "PDFを複数選択またはドラッグ&ドロップ",
+                type=["pdf"],
+                accept_multiple_files=True,
+            )
+            if uploaded_files:
+                st.info(f"アップロード済み: {len(uploaded_files)} 件")
+                total_size_mb = sum(_uploaded_size(f) for f in uploaded_files) / (1024 * 1024)
+                st.caption(f"合計サイズ: {total_size_mb:.1f} MB")
+                with st.expander("アップロードファイル一覧", expanded=False):
+                    for f in uploaded_files:
+                        st.write(f"- {f.name}")
             else:
-                run_uploaded_indexing()
+                st.session_state.pop("last_upload_signature", None)
+                st.caption("PDFをドロップ後、ボタン押下または自動取り込みで開始します。")
 
-        if auto_upload_index and uploaded_files:
-            if len(uploaded_files) > 1:
-                st.info(
-                    "複数ファイル一括アップロード時は、自動取り込みを止めています。"
-                    " Streamlit Cloud では再実行が重なりやすいため、"
-                    " アップロード完了後に手動ボタンで開始してください。"
-                )
-            else:
-                sig = _uploaded_signature(uploaded_files)
-                if st.session_state.get("last_upload_signature") != sig:
-                    st.session_state["last_upload_signature"] = sig
-                    st.toast("アップロードを検出。自動取り込みを開始します。")
-                    run_uploaded_indexing()
-                else:
-                    st.caption("同一ファイル構成のため自動再実行はスキップ中です。必要なら手動ボタンを押してください。")
-
-        st.divider()
-        st.subheader("2) フォルダ指定でPDF一括取り込み")
-        folder_input = st.text_input(
-            "フォルダパス（再帰的に *.pdf を検索）",
-            value=str(app.DATA_DIR.resolve()),
-        )
-        if st.button("フォルダ内PDFをインデックス", use_container_width=True):
-            try:
-                progress = st.progress(0, text="フォルダ走査と取り込みを開始します...")
+            def run_uploaded_indexing() -> None:
+                progress = st.progress(0, text="取り込みを開始します...")
                 status = st.empty()
                 stage_log = st.empty()
+                st.caption("初回は埋め込みモデルのロードで時間がかかる場合があります。")
 
-                def on_folder_progress(ratio01: float, message: str, t: int, a: int, r: int) -> None:
+                def on_upload_progress(ratio01: float, message: str, t: int, a: int, r: int) -> None:
                     ratio = int(ratio01 * 100)
                     progress.progress(
                         ratio,
@@ -765,17 +714,80 @@ def main() -> None:
                     status.info(f"更新ファイル={t} / 追加チャンク={a} / 置換削除チャンク={r}")
                     stage_log.caption(f"現在の工程: {message}")
 
-                scanned, touched, added, removed = index_pdf_folder(
-                    folder_input,
-                    progress_cb=on_folder_progress,
-                )
-                progress.progress(100, text="取り込み完了")
+                try:
+                    touched, added, removed, errors = index_uploaded_pdfs(
+                        uploaded_files,
+                        progress_cb=on_upload_progress,
+                    )
+                except Exception as e:
+                    status.empty()
+                    st.error(f"アップロード取り込みに失敗しました: {e}")
+                    return
+
+                completion_text = "取り込み完了" if not errors else "取り込み完了（一部エラーあり）"
+                progress.progress(100, text=completion_text)
                 status.empty()
-                st.success(
-                    f"走査PDF={scanned}, 更新ファイル={touched}, 追加チャンク={added}, 置換削除チャンク={removed}"
-                )
-            except Exception as e:
-                st.error(str(e))
+                st.success(f"完了: 更新ファイル={touched}, 追加チャンク={added}, 置換削除チャンク={removed}")
+                if errors:
+                    st.warning(f"失敗ファイル: {len(errors)} 件")
+                    with st.expander("失敗ファイル一覧", expanded=False):
+                        for msg in errors:
+                            st.write(f"- {msg}")
+
+            if st.button("アップロードPDFをインデックス", use_container_width=True):
+                if not uploaded_files:
+                    st.warning("PDFが選択されていません。")
+                else:
+                    run_uploaded_indexing()
+
+            if auto_upload_index and uploaded_files:
+                if len(uploaded_files) > 1:
+                    st.info(
+                        "複数ファイル一括アップロード時は、自動取り込みを止めています。"
+                        " Streamlit Cloud では再実行が重なりやすいため、"
+                        " アップロード完了後に手動ボタンで開始してください。"
+                    )
+                else:
+                    sig = _uploaded_signature(uploaded_files)
+                    if st.session_state.get("last_upload_signature") != sig:
+                        st.session_state["last_upload_signature"] = sig
+                        st.toast("アップロードを検出。自動取り込みを開始します。")
+                        run_uploaded_indexing()
+                    else:
+                        st.caption("同一ファイル構成のため自動再実行はスキップ中です。必要なら手動ボタンを押してください。")
+
+            st.divider()
+            st.subheader("2) フォルダ指定でPDF一括取り込み")
+            folder_input = st.text_input(
+                "フォルダパス（再帰的に *.pdf を検索）",
+                value=str(app.DATA_DIR.resolve()),
+            )
+            if st.button("フォルダ内PDFをインデックス", use_container_width=True):
+                try:
+                    progress = st.progress(0, text="フォルダ走査と取り込みを開始します...")
+                    status = st.empty()
+                    stage_log = st.empty()
+
+                    def on_folder_progress(ratio01: float, message: str, t: int, a: int, r: int) -> None:
+                        ratio = int(ratio01 * 100)
+                        progress.progress(
+                            ratio,
+                            text=f"処理中 {ratio}%: {message}",
+                        )
+                        status.info(f"更新ファイル={t} / 追加チャンク={a} / 置換削除チャンク={r}")
+                        stage_log.caption(f"現在の工程: {message}")
+
+                    scanned, touched, added, removed = index_pdf_folder(
+                        folder_input,
+                        progress_cb=on_folder_progress,
+                    )
+                    progress.progress(100, text="取り込み完了")
+                    status.empty()
+                    st.success(
+                        f"走査PDF={scanned}, 更新ファイル={touched}, 追加チャンク={added}, 置換削除チャンク={removed}"
+                    )
+                except Exception as e:
+                    st.error(str(e))
 
     with tab_query:
         st.subheader("類似箇所検索")
@@ -821,119 +833,120 @@ def main() -> None:
                 st.markdown(f"### 検索結果（表示: {len(docs)}件）")
                 render_sources(docs)
 
-    with tab_manage:
-        st.subheader("インデックス管理")
-        if "manage_data_root_input" not in st.session_state:
-            st.session_state["manage_data_root_input"] = st.session_state["runtime_data_root_dir"]
-        if "manage_chroma_root_input" not in st.session_state:
-            st.session_state["manage_chroma_root_input"] = st.session_state["runtime_chroma_root_dir"]
+    if admin_mode:
+        with tab_manage:
+            st.subheader("インデックス管理")
+            if "manage_data_root_input" not in st.session_state:
+                st.session_state["manage_data_root_input"] = st.session_state["runtime_data_root_dir"]
+            if "manage_chroma_root_input" not in st.session_state:
+                st.session_state["manage_chroma_root_input"] = st.session_state["runtime_chroma_root_dir"]
 
-        with st.expander("保存先Path設定", expanded=False):
-            data_col1, data_col2 = st.columns([6, 1])
-            data_col1.text_input(
-                "DataルートフォルダPath",
-                key="manage_data_root_input",
-                help="言語別データを管理するベースフォルダ。英語は配下の en/ を使用します。",
-            )
-            if data_col2.button("参照", key="browse_data_dir"):
-                selected = _pick_folder_dialog(st.session_state["manage_data_root_input"])
-                if selected:
-                    st.session_state["manage_data_root_input"] = selected
-                    st.rerun()
-                if os.name != "nt":
-                    st.warning("フォルダ選択ダイアログはWindowsのみ対応です。")
+            with st.expander("保存先Path設定", expanded=False):
+                data_col1, data_col2 = st.columns([6, 1])
+                data_col1.text_input(
+                    "DataルートフォルダPath",
+                    key="manage_data_root_input",
+                    help="言語別データを管理するベースフォルダ。英語は配下の en/ を使用します。",
+                )
+                if data_col2.button("参照", key="browse_data_dir"):
+                    selected = _pick_folder_dialog(st.session_state["manage_data_root_input"])
+                    if selected:
+                        st.session_state["manage_data_root_input"] = selected
+                        st.rerun()
+                    if os.name != "nt":
+                        st.warning("フォルダ選択ダイアログはWindowsのみ対応です。")
 
-            chroma_col1, chroma_col2 = st.columns([6, 1])
-            chroma_col1.text_input(
-                "ChromaルートフォルダPath",
-                key="manage_chroma_root_input",
-                help="日本語・英語の両インデックスを保持するベースフォルダ",
-            )
-            if chroma_col2.button("参照", key="browse_chroma_dir"):
-                selected = _pick_folder_dialog(st.session_state["manage_chroma_root_input"])
-                if selected:
-                    st.session_state["manage_chroma_root_input"] = selected
-                    st.rerun()
-                if os.name != "nt":
-                    st.warning("フォルダ選択ダイアログはWindowsのみ対応です。")
+                chroma_col1, chroma_col2 = st.columns([6, 1])
+                chroma_col1.text_input(
+                    "ChromaルートフォルダPath",
+                    key="manage_chroma_root_input",
+                    help="日本語・英語の両インデックスを保持するベースフォルダ",
+                )
+                if chroma_col2.button("参照", key="browse_chroma_dir"):
+                    selected = _pick_folder_dialog(st.session_state["manage_chroma_root_input"])
+                    if selected:
+                        st.session_state["manage_chroma_root_input"] = selected
+                        st.rerun()
+                    if os.name != "nt":
+                        st.warning("フォルダ選択ダイアログはWindowsのみ対応です。")
 
-            if st.button("Pathを適用", use_container_width=True):
-                try:
-                    data_path, chroma_path = _apply_runtime_paths(
-                        st.session_state["manage_data_root_input"],
-                        st.session_state["manage_chroma_root_input"],
-                        active_language_code,
-                    )
-                    st.session_state["runtime_data_root_dir"] = st.session_state["manage_data_root_input"]
-                    st.session_state["runtime_chroma_root_dir"] = st.session_state["manage_chroma_root_input"]
-                    st.session_state["manage_data_root_input"] = st.session_state["runtime_data_root_dir"]
-                    st.session_state["manage_chroma_root_input"] = st.session_state["runtime_chroma_root_dir"]
-                    _save_path_settings(
-                        st.session_state["runtime_data_root_dir"],
-                        st.session_state["runtime_chroma_root_dir"],
-                    )
-                    st.success(f"適用しました。data={data_path} / chroma={chroma_path}")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Path適用に失敗しました: {e}")
+                if st.button("Pathを適用", use_container_width=True):
+                    try:
+                        data_path, chroma_path = _apply_runtime_paths(
+                            st.session_state["manage_data_root_input"],
+                            st.session_state["manage_chroma_root_input"],
+                            active_language_code,
+                        )
+                        st.session_state["runtime_data_root_dir"] = st.session_state["manage_data_root_input"]
+                        st.session_state["runtime_chroma_root_dir"] = st.session_state["manage_chroma_root_input"]
+                        st.session_state["manage_data_root_input"] = st.session_state["runtime_data_root_dir"]
+                        st.session_state["manage_chroma_root_input"] = st.session_state["runtime_chroma_root_dir"]
+                        _save_path_settings(
+                            st.session_state["runtime_data_root_dir"],
+                            st.session_state["runtime_chroma_root_dir"],
+                        )
+                        st.success(f"適用しました。data={data_path} / chroma={chroma_path}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Path適用に失敗しました: {e}")
 
-        st.caption(f"現在の対象言語: {active_language_label}")
-        st.caption(f"現在のdata: {app.DATA_DIR}")
-        st.caption(f"現在のchroma(root): {app.CHROMA_DIR}")
-        st.caption(f"現在のcollection: {app.COLLECTION_NAME}")
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("このPathで再インデックス(index)", use_container_width=True):
-                try:
-                    with st.spinner("index実行中..."):
-                        app.process_files(incremental=True, remove_deleted=True)
-                    st.success("indexが完了しました。")
-                except Exception as e:
-                    st.error(f"index実行に失敗しました: {e}")
-        with col2:
-            if st.button("このPathで差分追加(add)", use_container_width=True):
-                try:
-                    with st.spinner("add実行中..."):
-                        app.process_files(incremental=True, remove_deleted=False)
-                    st.success("addが完了しました。")
-                except Exception as e:
-                    st.error(f"add実行に失敗しました: {e}")
+            st.caption(f"現在の対象言語: {active_language_label}")
+            st.caption(f"現在のdata: {app.DATA_DIR}")
+            st.caption(f"現在のchroma(root): {app.CHROMA_DIR}")
+            st.caption(f"現在のcollection: {app.COLLECTION_NAME}")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("このPathで再インデックス(index)", use_container_width=True):
+                    try:
+                        with st.spinner("index実行中..."):
+                            app.process_files(incremental=True, remove_deleted=True)
+                        st.success("indexが完了しました。")
+                    except Exception as e:
+                        st.error(f"index実行に失敗しました: {e}")
+            with col2:
+                if st.button("このPathで差分追加(add)", use_container_width=True):
+                    try:
+                        with st.spinner("add実行中..."):
+                            app.process_files(incremental=True, remove_deleted=False)
+                        st.success("addが完了しました。")
+                    except Exception as e:
+                        st.error(f"add実行に失敗しました: {e}")
 
-        st.divider()
-        st.subheader("GitHubインデックス同期")
-        st.caption("取り込み完了後に「GitHubに保存」を押すと、次回起動時も自動でインデックスが復元されます。")
-        sync_col1, sync_col2 = st.columns(2)
-        with sync_col1:
-            if st.button("💾 GitHubに保存", use_container_width=True):
-                with st.spinner("GitHubに保存中..."):
-                    ok, msg = save_index_to_github()
-                if ok:
-                    st.success(msg)
+            st.divider()
+            st.subheader("GitHubインデックス同期")
+            st.caption("取り込み完了後に「GitHubに保存」を押すと、次回起動時も自動でインデックスが復元されます。")
+            sync_col1, sync_col2 = st.columns(2)
+            with sync_col1:
+                if st.button("💾 GitHubに保存", use_container_width=True):
+                    with st.spinner("GitHubに保存中..."):
+                        ok, msg = save_index_to_github()
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+            with sync_col2:
+                if st.button("⬇️ GitHubから復元", use_container_width=True):
+                    with st.spinner("GitHubから復元中..."):
+                        ok, msg = load_index_from_github()
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+            st.divider()
+            manifest = app.load_manifest()
+            names = sorted(manifest.get("files", {}).keys())
+            st.write(f"登録ファイル数: {len(names)}")
+            selected = st.selectbox("削除対象ファイル", options=names if names else ["(なし)"])
+            if st.button("選択ファイルを削除", use_container_width=True):
+                if not names:
+                    st.info("削除対象がありません。")
+                elif selected == "(なし)":
+                    st.info("削除対象がありません。")
                 else:
-                    st.error(msg)
-        with sync_col2:
-            if st.button("⬇️ GitHubから復元", use_container_width=True):
-                with st.spinner("GitHubから復元中..."):
-                    ok, msg = load_index_from_github()
-                if ok:
-                    st.success(msg)
-                    st.rerun()
-                else:
-                    st.error(msg)
-
-        st.divider()
-        manifest = app.load_manifest()
-        names = sorted(manifest.get("files", {}).keys())
-        st.write(f"登録ファイル数: {len(names)}")
-        selected = st.selectbox("削除対象ファイル", options=names if names else ["(なし)"])
-        if st.button("選択ファイルを削除", use_container_width=True):
-            if not names:
-                st.info("削除対象がありません。")
-            elif selected == "(なし)":
-                st.info("削除対象がありません。")
-            else:
-                removed = delete_indexed_file(selected)
-                st.success(f"削除完了: {selected} ({removed} chunks)")
+                    removed = delete_indexed_file(selected)
+                    st.success(f"削除完了: {selected} ({removed} chunks)")
 
 
 if __name__ == "__main__":
