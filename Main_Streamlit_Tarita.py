@@ -562,6 +562,11 @@ def delete_indexed_file(file_name: str) -> int:
     return len(ids)
 
 
+def get_indexed_file_names() -> List[str]:
+    manifest = app.load_manifest()
+    return sorted(manifest.get("files", {}).keys())
+
+
 def main() -> None:
     st.set_page_config(page_title="Manual PDF RAG", layout="wide")
     st.title("Manual PDF RAG (Chroma Persistent)")
@@ -704,6 +709,19 @@ def main() -> None:
 
     with tab_query:
         st.subheader("類似箇所検索")
+        indexed_names = get_indexed_file_names()
+        st.caption(f"現在の登録ファイル数: {len(indexed_names)}")
+        if indexed_names:
+            preview_names = indexed_names[:5]
+            st.caption("登録例: " + " / ".join(preview_names))
+            if len(indexed_names) > len(preview_names):
+                st.caption(f"ほか {len(indexed_names) - len(preview_names)} 件")
+        else:
+            st.warning(
+                "現在のインデックスに登録ファイルがありません。"
+                " 複数ファイルをドラッグ&ドロップした場合は、"
+                " 『アップロードPDFをインデックス』を押してから検索してください。"
+            )
         search_text = st.text_area(
             "検索文",
             height=140,
