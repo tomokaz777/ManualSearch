@@ -5,6 +5,7 @@ import os
 import base64
 import csv
 import gc
+import re
 import zipfile
 import shutil
 from datetime import UTC, datetime
@@ -776,7 +777,13 @@ def _parse_evaluation_cases(uploaded_file) -> Tuple[List[Dict[str, object]], Lis
         raise ValueError("評価CSVが空です。")
 
     decoded = _decode_csv_bytes(csv_bytes)
-    reader = csv.DictReader(io.StringIO(decoded))
+    sample = decoded[:4096]
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;|\t")
+        delimiter = dialect.delimiter
+    except Exception:
+        delimiter = ","
+    reader = csv.DictReader(io.StringIO(decoded), delimiter=delimiter, skipinitialspace=True)
     if not reader.fieldnames:
         raise ValueError("CSVのヘッダー行が見つかりません。")
 
@@ -834,12 +841,14 @@ def _parse_evaluation_cases(uploaded_file) -> Tuple[List[Dict[str, object]], Lis
 
 def _doc_result_summary(doc) -> Dict[str, object]:
     md = doc.metadata or {}
+    detected_text = re.sub(r"\s+", " ", str(getattr(doc, "page_content", "") or "")).strip()
     return {
         "file": str(md.get("file_name", "")),
         "page": _parse_optional_int(md.get("page_start", md.get("page"))),
         "line": _parse_optional_int(md.get("start_line")),
         "score": md.get("relevance_score", ""),
         "match_type": str(md.get("match_type", "")),
+        "text": detected_text,
     }
 
 
@@ -847,26 +856,28 @@ def _build_evaluation_csv(rows: List[Dict[str, object]]) -> bytes:
     if not rows:
         return b""
     header = [
-        "row_no",
-        "status",
         "query",
         "expected_file",
         "expected_page",
         "expected_line",
+        "notes",
+        "row_no",
+        "status",
         "first_match_rank",
         "top1_hit",
         "top3_hit",
-        "matched_file",
-        "matched_page",
-        "matched_line",
-        "matched_score",
-        "matched_type",
+        "detected_file",
+        "detected_page",
+        "detected_line",
+        "detected_score",
+        "detected_type",
+        "detected_text",
         "top1_file",
         "top1_page",
         "top1_line",
         "top1_score",
         "top1_type",
-        "notes",
+        "top1_text",
         "error",
     ]
     buf = io.StringIO()
@@ -914,26 +925,28 @@ def run_evaluation_cases(
             execution_errors += 1
             rows.append(
                 {
-                    "row_no": case["row_no"],
-                    "status": "error",
                     "query": query_text,
                     "expected_file": case["expected_file"],
                     "expected_page": case["expected_page"] or "",
                     "expected_line": case["expected_line"] or "",
+                    "notes": case["notes"],
+                    "row_no": case["row_no"],
+                    "status": "error",
                     "first_match_rank": "",
                     "top1_hit": "",
                     "top3_hit": "",
-                    "matched_file": "",
-                    "matched_page": "",
-                    "matched_line": "",
-                    "matched_score": "",
-                    "matched_type": "",
+                    "detected_file": "",
+                    "detected_page": "",
+                    "detected_line": "",
+                    "detected_score": "",
+                    "detected_type": "",
+                    "detected_text": "",
                     "top1_file": "",
                     "top1_page": "",
                     "top1_line": "",
                     "top1_score": "",
                     "top1_type": "",
-                    "notes": case["notes"],
+                    "top1_text": "",
                     "error": str(e),
                 }
             )
@@ -948,6 +961,7 @@ def run_evaluation_cases(
                 break
 
         top1_summary = _doc_result_summary(results[0]) if results else {}
+        detected_summary = matched_summary if match_rank is not None else top1_summary
         top1_hit = match_rank == 1
         top3_hit = match_rank is not None and match_rank <= top3_window
         if match_rank is not None:
@@ -959,26 +973,28 @@ def run_evaluation_cases(
 
         rows.append(
             {
-                "row_no": case["row_no"],
-                "status": "hit" if match_rank is not None else "miss",
                 "query": query_text,
                 "expected_file": case["expected_file"],
                 "expected_page": case["expected_page"] or "",
                 "expected_line": case["expected_line"] or "",
+                "notes": case["notes"],
+                "row_no": case["row_no"],
+                "status": "hit" if match_rank is not None else "miss",
                 "first_match_rank": match_rank or "",
                 "top1_hit": "Y" if top1_hit else "",
                 "top3_hit": "Y" if top3_hit else "",
-                "matched_file": matched_summary.get("file", ""),
-                "matched_page": matched_summary.get("page", ""),
-                "matched_line": matched_summary.get("line", ""),
-                "matched_score": matched_summary.get("score", ""),
-                "matched_type": matched_summary.get("match_type", ""),
+                "detected_file": detected_summary.get("file", ""),
+                "detected_page": detected_summary.get("page", ""),
+                "detected_line": detected_summary.get("line", ""),
+                "detected_score": detected_summary.get("score", ""),
+                "detected_type": detected_summary.get("match_type", ""),
+                "detected_text": detected_summary.get("text", ""),
                 "top1_file": top1_summary.get("file", ""),
                 "top1_page": top1_summary.get("page", ""),
                 "top1_line": top1_summary.get("line", ""),
                 "top1_score": top1_summary.get("score", ""),
                 "top1_type": top1_summary.get("match_type", ""),
-                "notes": case["notes"],
+                "top1_text": top1_summary.get("text", ""),
                 "error": "",
             }
         )
@@ -1180,6 +1196,8 @@ def main() -> None:
                             return "0/0 (0.0%)"
                         return f"{hit_count}/{total_count} ({(hit_count / total_count) * 100:.1f}%)"
 
+                    if total_cases == 0:
+                        st.error("有効な評価行が 0 件でした。CSV の列名、区切り文字（`,` / `;` / `|` / タブ）、数値列を確認してください。")
                     st.caption(f"評価件数: {total_cases} / 評価上位件数: {evaluation_result['top_k']}")
                     st.caption(f"Top1一致率: {rate_text(top1_hits, total_cases)}")
                     st.caption(f"Top{top3_window}一致率: {rate_text(top3_hits, total_cases)}")
