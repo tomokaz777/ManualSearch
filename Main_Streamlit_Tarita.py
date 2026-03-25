@@ -3,6 +3,7 @@ import io
 import json
 import os
 import base64
+import csv
 import gc
 import zipfile
 import shutil
@@ -698,6 +699,303 @@ def debug_search_stored_chunks(search_text: str, max_hits: int = 20) -> Dict[str
     }
 
 
+def _parse_optional_int(value: object) -> Optional[int]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except Exception:
+        return None
+
+
+def _normalize_eval_file_name(name: object) -> str:
+    return _normalize_key(str(name or "").strip()).lower()
+
+
+def _file_name_matches(actual_name: object, expected_name: object) -> bool:
+    actual = _normalize_eval_file_name(actual_name)
+    expected = _normalize_eval_file_name(expected_name)
+    if not actual or not expected:
+        return False
+    if actual == expected:
+        return True
+    return Path(actual).name == Path(expected).name
+
+
+def _doc_matches_expected(doc, expected_file: str, expected_page: Optional[int], expected_line: Optional[int]) -> bool:
+    md = doc.metadata or {}
+    if not _file_name_matches(md.get("file_name", ""), expected_file):
+        return False
+
+    if expected_page is not None:
+        page_start = _parse_optional_int(md.get("page_start", md.get("page")))
+        page_end = _parse_optional_int(md.get("page_end", md.get("page")))
+        if page_start is None:
+            return False
+        if page_end is None:
+            page_end = page_start
+        if not (page_start <= expected_page <= page_end):
+            return False
+
+    if expected_line is not None:
+        line_start = _parse_optional_int(md.get("start_line"))
+        line_end = _parse_optional_int(md.get("end_line", md.get("start_line")))
+        if line_start is None:
+            return False
+        if line_end is None:
+            line_end = line_start
+        if not (line_start <= expected_line <= line_end):
+            return False
+
+    return True
+
+
+def _decode_csv_bytes(data: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "cp932"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    raise UnicodeDecodeError("csv", b"", 0, 1, "UTF-8/CP932 として読み込めませんでした")
+
+
+def _pick_csv_field(field_map: Dict[str, str], *candidates: str) -> Optional[str]:
+    for candidate in candidates:
+        if candidate in field_map:
+            return field_map[candidate]
+    return None
+
+
+def _parse_evaluation_cases(uploaded_file) -> Tuple[List[Dict[str, object]], List[str]]:
+    try:
+        csv_bytes = uploaded_file.getvalue()
+    except Exception:
+        csv_bytes = b""
+    if not csv_bytes:
+        raise ValueError("評価CSVが空です。")
+
+    decoded = _decode_csv_bytes(csv_bytes)
+    reader = csv.DictReader(io.StringIO(decoded))
+    if not reader.fieldnames:
+        raise ValueError("CSVのヘッダー行が見つかりません。")
+
+    field_map = {str(name or "").strip().lower(): str(name) for name in reader.fieldnames if str(name or "").strip()}
+    query_key = _pick_csv_field(field_map, "query", "search_text", "search", "text")
+    expected_file_key = _pick_csv_field(field_map, "expected_file", "file_name", "expected_filename", "filename")
+    expected_page_key = _pick_csv_field(field_map, "expected_page", "page", "page_no")
+    expected_line_key = _pick_csv_field(field_map, "expected_line", "line", "start_line")
+    notes_key = _pick_csv_field(field_map, "notes", "note", "memo", "comment")
+
+    if not query_key or not expected_file_key:
+        raise ValueError("CSVには少なくとも 'query' 列と 'expected_file' 列が必要です。")
+
+    cases: List[Dict[str, object]] = []
+    parse_errors: List[str] = []
+    for row_index, row in enumerate(reader, start=2):
+        values = [str(v or "").strip() for v in row.values()]
+        if not any(values):
+            continue
+
+        query_text = str(row.get(query_key) or "").strip()
+        expected_file = str(row.get(expected_file_key) or "").strip()
+        expected_page_raw = str(row.get(expected_page_key) or "").strip() if expected_page_key else ""
+        expected_line_raw = str(row.get(expected_line_key) or "").strip() if expected_line_key else ""
+        notes = str(row.get(notes_key) or "").strip() if notes_key else ""
+
+        if not query_text:
+            parse_errors.append(f"{row_index}行目: query が空です。")
+            continue
+        if not expected_file:
+            parse_errors.append(f"{row_index}行目: expected_file が空です。")
+            continue
+
+        expected_page = _parse_optional_int(expected_page_raw)
+        expected_line = _parse_optional_int(expected_line_raw)
+        if expected_page_raw and expected_page is None:
+            parse_errors.append(f"{row_index}行目: expected_page が数値ではありません。")
+            continue
+        if expected_line_raw and expected_line is None:
+            parse_errors.append(f"{row_index}行目: expected_line が数値ではありません。")
+            continue
+
+        cases.append(
+            {
+                "row_no": row_index,
+                "query": query_text,
+                "expected_file": expected_file,
+                "expected_page": expected_page,
+                "expected_line": expected_line,
+                "notes": notes,
+            }
+        )
+    return cases, parse_errors
+
+
+def _doc_result_summary(doc) -> Dict[str, object]:
+    md = doc.metadata or {}
+    return {
+        "file": str(md.get("file_name", "")),
+        "page": _parse_optional_int(md.get("page_start", md.get("page"))),
+        "line": _parse_optional_int(md.get("start_line")),
+        "score": md.get("relevance_score", ""),
+        "match_type": str(md.get("match_type", "")),
+    }
+
+
+def _build_evaluation_csv(rows: List[Dict[str, object]]) -> bytes:
+    if not rows:
+        return b""
+    header = [
+        "row_no",
+        "status",
+        "query",
+        "expected_file",
+        "expected_page",
+        "expected_line",
+        "first_match_rank",
+        "top1_hit",
+        "top3_hit",
+        "matched_file",
+        "matched_page",
+        "matched_line",
+        "matched_score",
+        "matched_type",
+        "top1_file",
+        "top1_page",
+        "top1_line",
+        "top1_score",
+        "top1_type",
+        "notes",
+        "error",
+    ]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=header)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({key: row.get(key, "") for key in header})
+    return buf.getvalue().encode("utf-8-sig")
+
+
+def _evaluation_file_name(language_code: str) -> str:
+    suffix = "en" if language_code == "en" else "ja"
+    return f"manualsearch_evaluation_{suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
+
+def run_evaluation_cases(
+    uploaded_file,
+    top_k: int,
+    progress_cb: Optional[Callable[[int, int, str], None]] = None,
+) -> Dict[str, object]:
+    cases, parse_errors = _parse_evaluation_cases(uploaded_file)
+    rows: List[Dict[str, object]] = []
+    total = len(cases)
+    top1_hits = 0
+    top3_hits = 0
+    matched_total = 0
+    execution_errors = 0
+    top3_window = min(3, max(1, int(top_k)))
+
+    for idx, case in enumerate(cases, start=1):
+        query_text = str(case["query"])
+        if progress_cb:
+            progress_cb(idx, total, query_text)
+
+        try:
+            results = app.search_ranked_matches(
+                query_text,
+                k=int(top_k),
+                min_score=0.0,
+                min_vector_score=0.0,
+                min_lexical_score=0.0,
+                candidate_multiplier=app.CANDIDATE_MULTIPLIER,
+            )
+        except Exception as e:
+            execution_errors += 1
+            rows.append(
+                {
+                    "row_no": case["row_no"],
+                    "status": "error",
+                    "query": query_text,
+                    "expected_file": case["expected_file"],
+                    "expected_page": case["expected_page"] or "",
+                    "expected_line": case["expected_line"] or "",
+                    "first_match_rank": "",
+                    "top1_hit": "",
+                    "top3_hit": "",
+                    "matched_file": "",
+                    "matched_page": "",
+                    "matched_line": "",
+                    "matched_score": "",
+                    "matched_type": "",
+                    "top1_file": "",
+                    "top1_page": "",
+                    "top1_line": "",
+                    "top1_score": "",
+                    "top1_type": "",
+                    "notes": case["notes"],
+                    "error": str(e),
+                }
+            )
+            continue
+
+        match_rank: Optional[int] = None
+        matched_summary: Dict[str, object] = {}
+        for rank, doc in enumerate(results, start=1):
+            if _doc_matches_expected(doc, str(case["expected_file"]), case["expected_page"], case["expected_line"]):
+                match_rank = rank
+                matched_summary = _doc_result_summary(doc)
+                break
+
+        top1_summary = _doc_result_summary(results[0]) if results else {}
+        top1_hit = match_rank == 1
+        top3_hit = match_rank is not None and match_rank <= top3_window
+        if match_rank is not None:
+            matched_total += 1
+        if top1_hit:
+            top1_hits += 1
+        if top3_hit:
+            top3_hits += 1
+
+        rows.append(
+            {
+                "row_no": case["row_no"],
+                "status": "hit" if match_rank is not None else "miss",
+                "query": query_text,
+                "expected_file": case["expected_file"],
+                "expected_page": case["expected_page"] or "",
+                "expected_line": case["expected_line"] or "",
+                "first_match_rank": match_rank or "",
+                "top1_hit": "Y" if top1_hit else "",
+                "top3_hit": "Y" if top3_hit else "",
+                "matched_file": matched_summary.get("file", ""),
+                "matched_page": matched_summary.get("page", ""),
+                "matched_line": matched_summary.get("line", ""),
+                "matched_score": matched_summary.get("score", ""),
+                "matched_type": matched_summary.get("match_type", ""),
+                "top1_file": top1_summary.get("file", ""),
+                "top1_page": top1_summary.get("page", ""),
+                "top1_line": top1_summary.get("line", ""),
+                "top1_score": top1_summary.get("score", ""),
+                "top1_type": top1_summary.get("match_type", ""),
+                "notes": case["notes"],
+                "error": "",
+            }
+        )
+
+    return {
+        "cases": cases,
+        "rows": rows,
+        "parse_errors": parse_errors,
+        "top1_hits": top1_hits,
+        "top3_hits": top3_hits,
+        "matched_total": matched_total,
+        "miss_total": max(total - matched_total, 0),
+        "execution_errors": execution_errors,
+        "top3_window": top3_window,
+    }
+
+
 def main() -> None:
     st.set_page_config(page_title="Manual PDF RAG", layout="wide")
     st.title("Manual PDF RAG (Chroma Persistent)")
@@ -764,6 +1062,7 @@ def main() -> None:
 
     if admin_mode:
         debug_result_key = f"debug_chunk_search_result_{active_language_code}"
+        evaluation_result_key = f"evaluation_result_{active_language_code}"
         st.sidebar.divider()
         with st.sidebar.expander("デバッグ検索", expanded=False):
             st.caption("保存済みチャンク全文に対して、生文字列一致と空白正規化一致を確認します。")
@@ -806,6 +1105,119 @@ def main() -> None:
                         f"{idx}. `{hit['file_name']}` / p.{page_text} / 行:{hit['start_line']}-{hit['end_line']}"
                     )
                     st.code(str(hit["snippet"] or "(スニペットなし)"), language="text")
+
+        st.sidebar.divider()
+        with st.sidebar.expander("評価", expanded=False):
+            st.caption("現在の検索ロジックをそのまま使って、正解付きCSVを一括評価します。")
+            st.caption("必須列: query, expected_file / 推奨列: expected_page, expected_line, notes")
+            st.code(
+                "query,expected_file,expected_page,expected_line,notes\n"
+                "\"An attempt to release a wafer is made, but the wafer cannot be released normally\","
+                "streamlit_uploads/90202-1134DJ.pdf,12,34,example",
+                language="text",
+            )
+            evaluation_csv = st.file_uploader(
+                "評価CSV",
+                type=["csv"],
+                key=f"evaluation_csv_{active_language_code}",
+                help="UTF-8 / UTF-8(BOM) / CP932 の CSV を読み込みます。",
+            )
+            evaluation_top_k = st.number_input(
+                "評価対象の上位件数",
+                min_value=1,
+                max_value=30,
+                value=min(5, max(1, int(app.TOP_K))),
+                step=1,
+                key=f"evaluation_top_k_{active_language_code}",
+            )
+
+            if st.button("CSVを一括評価", use_container_width=True, key=f"evaluation_run_{active_language_code}"):
+                if not evaluation_csv:
+                    st.sidebar.warning("評価CSVを選択してください。")
+                else:
+                    progress = st.progress(0, text="評価を開始します...")
+                    progress_text = st.empty()
+
+                    def on_eval_progress(done: int, total: int, query: str) -> None:
+                        safe_total = max(total, 1)
+                        ratio = int(done * 100 / safe_total)
+                        progress.progress(min(ratio, 100), text=f"評価中 {ratio}%")
+                        progress_text.caption(f"{done}/{total} 件: {query[:60]}")
+
+                    try:
+                        result = run_evaluation_cases(
+                            evaluation_csv,
+                            top_k=int(evaluation_top_k),
+                            progress_cb=on_eval_progress,
+                        )
+                        result["top_k"] = int(evaluation_top_k)
+                        result["csv_bytes"] = _build_evaluation_csv(result["rows"])
+                        result["file_name"] = _evaluation_file_name(active_language_code)
+                        st.session_state[evaluation_result_key] = result
+                        progress.progress(100, text="評価完了")
+                        progress_text.empty()
+                    except Exception as e:
+                        st.session_state[evaluation_result_key] = {"error": str(e)}
+                        progress.empty()
+                        progress_text.empty()
+
+            evaluation_result = st.session_state.get(evaluation_result_key)
+            if evaluation_result:
+                if evaluation_result.get("error"):
+                    st.error(str(evaluation_result["error"]))
+                else:
+                    total_cases = len(evaluation_result["cases"])
+                    top1_hits = int(evaluation_result["top1_hits"])
+                    top3_hits = int(evaluation_result["top3_hits"])
+                    matched_total = int(evaluation_result["matched_total"])
+                    miss_total = int(evaluation_result["miss_total"])
+                    parse_errors = list(evaluation_result["parse_errors"])
+                    execution_errors = int(evaluation_result["execution_errors"])
+                    top3_window = int(evaluation_result["top3_window"])
+
+                    def rate_text(hit_count: int, total_count: int) -> str:
+                        if total_count <= 0:
+                            return "0/0 (0.0%)"
+                        return f"{hit_count}/{total_count} ({(hit_count / total_count) * 100:.1f}%)"
+
+                    st.caption(f"評価件数: {total_cases} / 評価上位件数: {evaluation_result['top_k']}")
+                    st.caption(f"Top1一致率: {rate_text(top1_hits, total_cases)}")
+                    st.caption(f"Top{top3_window}一致率: {rate_text(top3_hits, total_cases)}")
+                    st.caption(f"検出件数: {rate_text(matched_total, total_cases)}")
+                    st.caption(f"未検出件数: {miss_total}")
+                    if execution_errors:
+                        st.warning(f"検索実行エラー: {execution_errors} 件")
+                    if parse_errors:
+                        st.warning(f"CSV読込エラー: {len(parse_errors)} 件")
+                        with st.expander("CSV読込エラー一覧", expanded=False):
+                            for msg in parse_errors:
+                                st.write(f"- {msg}")
+
+                    result_rows = evaluation_result["rows"]
+                    miss_rows = [row for row in result_rows if row.get("status") == "miss"]
+                    error_rows = [row for row in result_rows if row.get("status") == "error"]
+                    if miss_rows:
+                        with st.expander("未検出プレビュー", expanded=False):
+                            for row in miss_rows[:10]:
+                                st.markdown(
+                                    f"- {row['row_no']}行目: `{row['expected_file']}` / p.{row['expected_page'] or '(任意)'}"
+                                )
+                                st.caption(str(row["query"])[:120])
+                    if error_rows:
+                        with st.expander("検索実行エラー一覧", expanded=False):
+                            for row in error_rows[:10]:
+                                st.markdown(f"- {row['row_no']}行目: {row['error']}")
+
+                    csv_bytes = evaluation_result.get("csv_bytes", b"")
+                    if csv_bytes:
+                        st.download_button(
+                            "評価結果CSVを保存",
+                            data=csv_bytes,
+                            file_name=str(evaluation_result["file_name"]),
+                            mime="text/csv",
+                            use_container_width=True,
+                            key=f"evaluation_download_{active_language_code}",
+                        )
 
     if admin_mode:
         tab_ingest, tab_query, tab_manage = st.tabs(["取り込み", "検索", "管理"])
