@@ -5,11 +5,11 @@ import os
 import base64
 import gc
 import zipfile
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-import requests
 import streamlit as st
 
 import app
@@ -141,124 +141,114 @@ def _uploaded_size(uploaded_file) -> int:
         return len(uploaded_file.getvalue() or b"")
 
 
-# ── GitHub Releases 連携 ──────────────────────────────────────────────────────
-
-_GITHUB_RELEASE_TAG = "index-backup"
+# ── ローカルバックアップ / サーバー上データ削除 ─────────────────────────────
 
 
-def _get_github_secret(key: str) -> str:
-    """環境変数 → Streamlit secrets の順で取得する。"""
-    val = os.getenv(key, "")
-    if not val:
-        try:
-            val = st.secrets.get(key, "")
-        except Exception:
-            pass
-    return str(val or "")
-
-
-def _github_headers() -> Dict:
-    token = _get_github_secret("GITHUB_TOKEN")
-    return {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-
-def _zip_chroma_dir() -> bytes:
+def _zip_directory(root_dir: Path) -> bytes:
+    root_dir.mkdir(parents=True, exist_ok=True)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for f in app.CHROMA_DIR.rglob("*"):
-            if f.is_file():
-                zf.write(f, f.relative_to(app.CHROMA_DIR))
+        for file_path in sorted(root_dir.rglob("*")):
+            if file_path.is_file():
+                zf.write(file_path, file_path.relative_to(root_dir))
     return buf.getvalue()
 
 
-def save_index_to_github() -> Tuple[bool, str]:
-    """chroma_db を zip して GitHub Releases に保存する。"""
-    token = _get_github_secret("GITHUB_TOKEN")
-    repo = _get_github_secret("GITHUB_REPO")
-    if not token or not repo:
-        return False, "GITHUB_TOKEN または GITHUB_REPO が未設定です"
-
-    hdrs = _github_headers()
-    base = f"https://api.github.com/repos/{repo}"
-
-    # 既存リリースを削除
-    r = requests.get(f"{base}/releases/tags/{_GITHUB_RELEASE_TAG}", headers=hdrs, timeout=30)
-    if r.status_code == 200:
-        requests.delete(f"{base}/releases/{r.json()['id']}", headers=hdrs, timeout=30)
-    requests.delete(f"{base}/git/refs/tags/{_GITHUB_RELEASE_TAG}", headers=hdrs, timeout=30)
-
-    # 新規リリース作成
-    r = requests.post(
-        f"{base}/releases",
-        json={
-            "tag_name": _GITHUB_RELEASE_TAG,
-            "name": "Search Index Backup",
-            "body": f"更新日時: {_utc_now_iso()}",
-            "prerelease": True,
-        },
-        headers=hdrs,
-        timeout=30,
-    )
-    if r.status_code != 201:
-        return False, f"リリース作成失敗 ({r.status_code})"
-
-    upload_url = r.json()["upload_url"].split("{")[0]
-
-    # zip 作成 & アップロード
-    zip_data = _zip_chroma_dir()
-    upload_hdrs = {"Authorization": f"Bearer {token}", "Content-Type": "application/zip"}
-    r = requests.post(
-        f"{upload_url}?name=chroma_db.zip",
-        data=zip_data,
-        headers=upload_hdrs,
-        timeout=180,
-    )
-    if r.status_code != 201:
-        return False, f"アップロード失敗 ({r.status_code})"
-
-    return True, f"保存完了 ({len(zip_data) // 1024} KB)"
+def _safe_extract_zip(zip_file: zipfile.ZipFile, dest_dir: Path) -> None:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_root = dest_dir.resolve()
+    for member in zip_file.infolist():
+        member_name = member.filename
+        if not member_name:
+            continue
+        target_path = (dest_dir / member_name).resolve()
+        if target_path != dest_root and dest_root not in target_path.parents:
+            raise ValueError("zip内に不正なパスが含まれています")
+    zip_file.extractall(dest_dir)
 
 
-def load_index_from_github() -> Tuple[bool, str]:
-    """GitHub Releases から chroma_db を復元する。"""
-    token = _get_github_secret("GITHUB_TOKEN")
-    repo = _get_github_secret("GITHUB_REPO")
-    if not token or not repo:
-        return False, "GITHUB_TOKEN または GITHUB_REPO が未設定です"
+def _remove_tree_contents(root_dir: Path) -> int:
+    if not root_dir.exists():
+        return 0
+    removed = 0
+    for path in sorted(root_dir.iterdir(), key=lambda p: (p.is_file(), len(p.parts)), reverse=True):
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        removed += 1
+    return removed
 
-    hdrs = _github_headers()
-    base = f"https://api.github.com/repos/{repo}"
 
-    # リリース取得
-    r = requests.get(f"{base}/releases/tags/{_GITHUB_RELEASE_TAG}", headers=hdrs, timeout=30)
-    if r.status_code != 200:
-        return False, "保存済みインデックスが見つかりません"
+def _backup_file_name() -> str:
+    return f"manualsearch_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
 
-    asset = next((a for a in r.json().get("assets", []) if a["name"] == "chroma_db.zip"), None)
-    if not asset:
-        return False, "chroma_db.zip が見つかりません"
 
-    # アセットをダウンロード（認証付き）
-    dl_hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/octet-stream"}
-    r = requests.get(
-        f"{base}/releases/assets/{asset['id']}",
-        headers=dl_hdrs,
-        allow_redirects=True,
-        timeout=180,
-    )
-    if r.status_code != 200:
-        return False, f"ダウンロード失敗 ({r.status_code})"
+def has_local_backup_source() -> bool:
+    if not app.CHROMA_DIR.exists():
+        return False
+    return any(path.is_file() for path in app.CHROMA_DIR.rglob("*"))
 
-    # 展開
-    app.CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
-        zf.extractall(app.CHROMA_DIR)
 
-    return True, f"復元完了 ({len(r.content) // 1024} KB)"
+def build_local_backup_zip() -> Tuple[Optional[bytes], str]:
+    app.ensure_dirs()
+    if not has_local_backup_source():
+        return None, "保存対象のインデックスがありません"
+    zip_data = _zip_directory(app.CHROMA_DIR)
+    return zip_data, f"バックアップ準備完了 ({len(zip_data) // 1024} KB)"
+
+
+def restore_index_from_local_backup(uploaded_file) -> Tuple[bool, str]:
+    if uploaded_file is None:
+        return False, "バックアップzipが選択されていません"
+    try:
+        zip_bytes = uploaded_file.getvalue()
+    except Exception:
+        zip_bytes = b""
+    if not zip_bytes:
+        return False, "バックアップzipが空です"
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            members = [name for name in zf.namelist() if name and not name.endswith("/")]
+            if not members:
+                return False, "zip内に復元対象ファイルがありません"
+            _remove_tree_contents(app.CHROMA_DIR)
+            app.CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+            _safe_extract_zip(zf, app.CHROMA_DIR)
+    except zipfile.BadZipFile:
+        return False, "zipファイルとして読み込めませんでした"
+    except Exception as e:
+        return False, f"復元に失敗しました: {e}"
+
+    return True, f"ローカルバックアップを復元しました ({len(zip_bytes) // 1024} KB)"
+
+
+def clear_server_runtime_data(data_root_dir: str, chroma_root_dir: str) -> Tuple[bool, str]:
+    data_root = Path(data_root_dir).expanduser().resolve()
+    chroma_root = Path(chroma_root_dir).expanduser().resolve()
+    removed_items = 0
+
+    upload_dirs = [
+        data_root / "streamlit_uploads",
+        data_root / ENGLISH_DATA_DIRNAME / "streamlit_uploads",
+    ]
+    for upload_dir in upload_dirs:
+        removed_items += _remove_tree_contents(upload_dir)
+        try:
+            if upload_dir.exists():
+                upload_dir.rmdir()
+        except OSError:
+            pass
+
+    removed_items += _remove_tree_contents(chroma_root)
+    chroma_root.mkdir(parents=True, exist_ok=True)
+    app.ensure_dirs()
+    app.save_manifest({"files": {}})
+    return True, f"サーバー上データを削除しました (削除対象={removed_items}件)"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -659,15 +649,36 @@ def main() -> None:
         active_language_code,
     )
 
-    # 起動時に chroma_db が空なら GitHub から自動復元
-    if "_auto_restore_done" not in st.session_state:
-        st.session_state["_auto_restore_done"] = True
-        if _get_github_secret("GITHUB_TOKEN"):
-            has_index = any(app.CHROMA_DIR.rglob("*.sqlite3"))
-            if not has_index:
-                with st.spinner("GitHubからインデックスを自動復元中..."):
-                    ok, msg = load_index_from_github()
-                st.toast(f"✅ {msg}" if ok else f"⚠️ {msg}")
+    sidebar_restore_result_key = f"sidebar_restore_result_{active_language_code}"
+    sidebar_restore_nonce_key = f"sidebar_restore_nonce_{active_language_code}"
+    if sidebar_restore_nonce_key not in st.session_state:
+        st.session_state[sidebar_restore_nonce_key] = 0
+    restore_feedback = st.session_state.pop(sidebar_restore_result_key, None)
+    st.sidebar.divider()
+    st.sidebar.subheader("検索データ読込")
+    st.sidebar.caption("ローカル保存したバックアップzipを復元してから検索します。")
+    if restore_feedback:
+        if restore_feedback["ok"]:
+            st.sidebar.success(restore_feedback["msg"])
+        else:
+            st.sidebar.error(restore_feedback["msg"])
+    sidebar_backup_zip = st.sidebar.file_uploader(
+        "バックアップzip",
+        type=["zip"],
+        key=f"sidebar_backup_zip_{active_language_code}_{st.session_state[sidebar_restore_nonce_key]}",
+        help="管理タブで保存したローカルバックアップzipを読み込みます。",
+    )
+    if st.sidebar.button("バックアップzipを復元", use_container_width=True, key=f"restore_backup_{active_language_code}"):
+        if not sidebar_backup_zip:
+            st.sidebar.warning("バックアップzipを選択してください。")
+        else:
+            with st.spinner("ローカルバックアップを復元中..."):
+                ok, msg = restore_index_from_local_backup(sidebar_backup_zip)
+            st.session_state[sidebar_restore_result_key] = {"ok": ok, "msg": msg}
+            if ok:
+                st.session_state[sidebar_restore_nonce_key] += 1
+                st.session_state.pop("last_upload_signature", None)
+            st.rerun()
 
     if admin_mode:
         tab_ingest, tab_query, tab_manage = st.tabs(["取り込み", "検索", "管理"])
@@ -825,8 +836,7 @@ def main() -> None:
         else:
             st.warning(
                 "現在のインデックスに登録ファイルがありません。"
-                " 複数ファイルをドラッグ&ドロップした場合は、"
-                " 『アップロードPDFをインデックス』を押してから検索してください。"
+                " サイドバーの『バックアップzipを復元』、または管理者モードでの取り込み後に検索してください。"
             )
         search_text = st.text_area(
             "検索文",
@@ -859,6 +869,12 @@ def main() -> None:
     if admin_mode:
         with tab_manage:
             st.subheader("インデックス管理")
+            local_backup_bytes_key = f"local_backup_bytes_{active_language_code}"
+            local_backup_name_key = f"local_backup_name_{active_language_code}"
+            local_restore_result_key = f"local_restore_result_{active_language_code}"
+            local_restore_nonce_key = f"local_restore_nonce_{active_language_code}"
+            if local_restore_nonce_key not in st.session_state:
+                st.session_state[local_restore_nonce_key] = 0
             if "manage_data_root_input" not in st.session_state:
                 st.session_state["manage_data_root_input"] = st.session_state["runtime_data_root_dir"]
             if "manage_chroma_root_input" not in st.session_state:
@@ -936,26 +952,82 @@ def main() -> None:
                         st.error(f"add実行に失敗しました: {e}")
 
             st.divider()
-            st.subheader("GitHubインデックス同期")
-            st.caption("取り込み完了後に「GitHubに保存」を押すと、次回起動時も自動でインデックスが復元されます。")
-            sync_col1, sync_col2 = st.columns(2)
-            with sync_col1:
-                if st.button("💾 GitHubに保存", use_container_width=True):
-                    with st.spinner("GitHubに保存中..."):
-                        ok, msg = save_index_to_github()
-                    if ok:
-                        st.success(msg)
+            st.subheader("ローカルバックアップ")
+            st.caption("サーバー上の検索データを zip で保存し、必要時にローカルから復元します。GitHub には保存しません。")
+            if restore_feedback:
+                st.info("サイドバーから復元した結果を反映済みです。必要ならこのまま検索できます。")
+            restore_result = st.session_state.pop(local_restore_result_key, None)
+            if restore_result:
+                if restore_result["ok"]:
+                    st.success(restore_result["msg"])
+                else:
+                    st.error(restore_result["msg"])
+            backup_col1, backup_col2 = st.columns(2)
+            with backup_col1:
+                if st.button("バックアップzipを準備", use_container_width=True):
+                    with st.spinner("ローカルバックアップを準備中..."):
+                        zip_data, msg = build_local_backup_zip()
+                    if zip_data is None:
+                        st.warning(msg)
+                        st.session_state.pop(local_backup_bytes_key, None)
+                        st.session_state.pop(local_backup_name_key, None)
                     else:
-                        st.error(msg)
-            with sync_col2:
-                if st.button("⬇️ GitHubから復元", use_container_width=True):
-                    with st.spinner("GitHubから復元中..."):
-                        ok, msg = load_index_from_github()
-                    if ok:
+                        st.session_state[local_backup_bytes_key] = zip_data
+                        st.session_state[local_backup_name_key] = _backup_file_name()
                         st.success(msg)
+                backup_bytes = st.session_state.get(local_backup_bytes_key)
+                backup_name = st.session_state.get(local_backup_name_key, _backup_file_name())
+                if backup_bytes:
+                    st.download_button(
+                        "💾 ローカルへバックアップ保存",
+                        data=backup_bytes,
+                        file_name=backup_name,
+                        mime="application/zip",
+                        use_container_width=True,
+                    )
+                else:
+                    st.caption("まず『バックアップzipを準備』を押してください。")
+            with backup_col2:
+                restore_zip = st.file_uploader(
+                    "ローカルのバックアップzipをアップロード",
+                    type=["zip"],
+                    key=f"manage_restore_zip_{active_language_code}_{st.session_state[local_restore_nonce_key]}",
+                    help="保存済みのバックアップzipを選択すると、現在の検索データを置き換えて復元します。",
+                )
+                if st.button("ローカルzipから復元", use_container_width=True):
+                    if not restore_zip:
+                        st.warning("バックアップzipを選択してください。")
+                    else:
+                        with st.spinner("ローカルバックアップを復元中..."):
+                            ok, msg = restore_index_from_local_backup(restore_zip)
+                        st.session_state[local_restore_result_key] = {"ok": ok, "msg": msg}
+                        if ok:
+                            st.session_state[local_restore_nonce_key] += 1
+                            st.session_state.pop("last_upload_signature", None)
                         st.rerun()
-                    else:
-                        st.error(msg)
+
+            st.divider()
+            st.subheader("サーバー上データ")
+            st.caption("検索終了後に押すと、サーバー上に残っているインデックスとアップロード一時ファイルを削除します。")
+            confirm_clear = st.checkbox(
+                "サーバー上データの全削除を確認",
+                value=False,
+                key=f"confirm_clear_server_data_{active_language_code}",
+            )
+            if st.button("サーバー上データを全削除", use_container_width=True, disabled=not confirm_clear):
+                with st.spinner("サーバー上データを削除中..."):
+                    ok, msg = clear_server_runtime_data(
+                        st.session_state["runtime_data_root_dir"],
+                        st.session_state["runtime_chroma_root_dir"],
+                    )
+                st.session_state.pop("last_upload_signature", None)
+                st.session_state.pop(local_backup_bytes_key, None)
+                st.session_state.pop(local_backup_name_key, None)
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
 
             st.divider()
             manifest = app.load_manifest()
