@@ -19,6 +19,7 @@ LANGUAGE_OPTIONS = [("日本語", "ja"), ("English", "en")]
 LANGUAGE_LABEL_TO_CODE = {label: code for label, code in LANGUAGE_OPTIONS}
 LANGUAGE_CODE_TO_LABEL = {code: label for label, code in LANGUAGE_OPTIONS}
 ENGLISH_DATA_DIRNAME = "en"
+DEFAULT_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "manual_rag")
 
 
 def _get_upload_cache_dir() -> Path:
@@ -30,18 +31,23 @@ def _build_language_runtime(
     chroma_dir: str,
     language_code: str,
 ) -> Tuple[Path, Path, Path, str, set]:
+    base_collection_name = getattr(
+        app,
+        "BASE_COLLECTION_NAME",
+        getattr(app, "COLLECTION_NAME", DEFAULT_COLLECTION_NAME),
+    )
     data_root = Path(data_dir).expanduser().resolve()
     chroma_root = Path(chroma_dir).expanduser().resolve()
     if language_code == "en":
         data_path = data_root / ENGLISH_DATA_DIRNAME
         manifest_path = chroma_root / "index_manifest_en.json"
-        collection_name = f"{app.BASE_COLLECTION_NAME}_en"
+        collection_name = f"{base_collection_name}_en"
         ignored_dirs = set()
     else:
         # Keep existing Japanese data/index visible by default.
         data_path = data_root
         manifest_path = chroma_root / "index_manifest.json"
-        collection_name = app.BASE_COLLECTION_NAME
+        collection_name = base_collection_name
         ignored_dirs = {ENGLISH_DATA_DIRNAME}
     return data_path, chroma_root, manifest_path, collection_name, ignored_dirs
 
