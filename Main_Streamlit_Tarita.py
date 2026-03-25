@@ -676,8 +676,27 @@ def main() -> None:
 
     if admin_mode:
         with tab_ingest:
+            upload_result_key = f"upload_index_result_{active_language_code}"
+            uploader_nonce_key = f"uploaded_pdf_nonce_{active_language_code}"
+            if uploader_nonce_key not in st.session_state:
+                st.session_state[uploader_nonce_key] = 0
+
             st.subheader("1) PDFドラッグ&ドロップ取り込み")
             st.caption(f"現在の対象言語: {active_language_label}")
+            prior_upload_result = st.session_state.pop(upload_result_key, None)
+            if prior_upload_result:
+                st.success(
+                    "完了: 更新ファイル={touched}, 追加チャンク={added}, 置換削除チャンク={removed}".format(
+                        touched=prior_upload_result["touched"],
+                        added=prior_upload_result["added"],
+                        removed=prior_upload_result["removed"],
+                    )
+                )
+                if prior_upload_result["errors"]:
+                    st.warning(f"失敗ファイル: {len(prior_upload_result['errors'])} 件")
+                    with st.expander("失敗ファイル一覧", expanded=False):
+                        for msg in prior_upload_result["errors"]:
+                            st.write(f"- {msg}")
             auto_upload_index = st.checkbox(
                 "アップロード後に自動で取り込み開始",
                 value=True,
@@ -687,6 +706,7 @@ def main() -> None:
                 "PDFを複数選択またはドラッグ&ドロップ",
                 type=["pdf"],
                 accept_multiple_files=True,
+                key=f"uploaded_pdf_files_{active_language_code}_{st.session_state[uploader_nonce_key]}",
             )
             if uploaded_files:
                 st.info(f"アップロード済み: {len(uploaded_files)} 件")
@@ -727,12 +747,15 @@ def main() -> None:
                 completion_text = "取り込み完了" if not errors else "取り込み完了（一部エラーあり）"
                 progress.progress(100, text=completion_text)
                 status.empty()
-                st.success(f"完了: 更新ファイル={touched}, 追加チャンク={added}, 置換削除チャンク={removed}")
-                if errors:
-                    st.warning(f"失敗ファイル: {len(errors)} 件")
-                    with st.expander("失敗ファイル一覧", expanded=False):
-                        for msg in errors:
-                            st.write(f"- {msg}")
+                st.session_state[upload_result_key] = {
+                    "touched": touched,
+                    "added": added,
+                    "removed": removed,
+                    "errors": errors,
+                }
+                st.session_state[uploader_nonce_key] += 1
+                st.session_state.pop("last_upload_signature", None)
+                st.rerun()
 
             if st.button("アップロードPDFをインデックス", use_container_width=True):
                 if not uploaded_files:
