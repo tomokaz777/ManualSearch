@@ -5,6 +5,7 @@ langchain-openai
 langchain-huggingface
 sentence-transformers
 pypdf
+PyMuPDF
 cryptography
 pycryptodome
 python-dotenv

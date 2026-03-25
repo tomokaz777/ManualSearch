@@ -6,6 +6,7 @@ import json
 import os
 import re
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -23,6 +24,11 @@ try:
     from pypdf import PdfReader
 except Exception:
     PdfReader = None
+
+try:
+    import fitz
+except Exception:
+    fitz = None
 
 
 load_dotenv()
@@ -188,18 +194,41 @@ def list_data_files() -> List[Path]:
 
 
 def read_pdf(path: Path) -> FileContent:
-    if PdfReader is None:
-        raise RuntimeError("pypdf is required to process PDF files.")
-    reader = PdfReader(str(path))
+    candidates: List[Tuple[str, FileContent]] = []
+    errors: List[str] = []
+
+    try:
+        candidates.append(("pypdf", _read_pdf_with_pypdf(path)))
+    except Exception as e:
+        errors.append(f"pypdf: {e}")
+
+    try:
+        candidates.append(("pymupdf", _read_pdf_with_pymupdf(path)))
+    except Exception as e:
+        errors.append(f"pymupdf: {e}")
+
+    if not candidates:
+        raise RuntimeError("PDFからテキストを抽出できませんでした。\n" + "\n".join(errors))
+
+    _, best_content = max(candidates, key=lambda item: _file_content_score(item[1]))
+    return best_content
+
+
+def _normalize_extracted_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    normalized = normalized.replace("\r\n", "\n").replace("\r", "\n").replace("\xa0", " ")
+    normalized = re.sub(r"[\u00ad\u200b\u200c\u200d\ufeff]", "", normalized)
+    normalized = re.sub(r"(?<=\w)-\n(?=\w)", "", normalized)
+    return normalized
+
+
+def _build_file_content(page_texts: List[str]) -> FileContent:
     full_text_parts: List[str] = []
     page_ranges: List[Tuple[int, int, int]] = []
-    page_texts: List[str] = []
     cursor = 0
-    for i, page in enumerate(reader.pages, start=1):
-        page_text = page.extract_text() or ""
+    for i, page_text in enumerate(page_texts, start=1):
         if page_text and not page_text.endswith("\n"):
             page_text += "\n"
-        page_texts.append(page_text)
         start = cursor
         full_text_parts.append(page_text)
         cursor += len(page_text)
@@ -207,6 +236,44 @@ def read_pdf(path: Path) -> FileContent:
         if end > start:
             page_ranges.append((start, end, i))
     return FileContent(text="".join(full_text_parts), page_ranges=page_ranges, page_texts=page_texts)
+
+
+def _read_pdf_with_pypdf(path: Path) -> FileContent:
+    if PdfReader is None:
+        raise RuntimeError("pypdf is required to process PDF files.")
+    reader = PdfReader(str(path))
+    if getattr(reader, "is_encrypted", False):
+        try:
+            reader.decrypt("")
+        except Exception:
+            pass
+    page_texts: List[str] = []
+    for page in reader.pages:
+        page_texts.append(_normalize_extracted_text(page.extract_text() or ""))
+    return _build_file_content(page_texts)
+
+
+def _read_pdf_with_pymupdf(path: Path) -> FileContent:
+    if fitz is None:
+        raise RuntimeError("PyMuPDF is not available.")
+    doc = fitz.open(str(path))
+    try:
+        if getattr(doc, "needs_pass", 0):
+            auth = doc.authenticate("")
+            if not auth:
+                raise RuntimeError("PDFを開くためのパスワードが必要です。")
+        page_texts = [_normalize_extracted_text(page.get_text("text") or "") for page in doc]
+    finally:
+        doc.close()
+    return _build_file_content(page_texts)
+
+
+def _file_content_score(content: FileContent) -> int:
+    text = re.sub(r"\s+", "", content.text or "")
+    if not text:
+        return 0
+    token_chars = len(re.findall(r"[A-Za-z0-9ぁ-んァ-ン一-龯]", text))
+    return len(text) + token_chars
 
 
 def read_file_content(path: Path) -> FileContent:
