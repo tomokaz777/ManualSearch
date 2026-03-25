@@ -31,7 +31,10 @@ load_dotenv()
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 CHROMA_DIR = Path(os.getenv("CHROMA_DIR", "chroma_db"))
 MANIFEST_PATH = CHROMA_DIR / "index_manifest.json"
-COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "manual_rag")
+BASE_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "manual_rag")
+COLLECTION_NAME = BASE_COLLECTION_NAME
+ACTIVE_LANGUAGE = "ja"
+IGNORED_TOP_LEVEL_DIRS = set()
 
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
@@ -172,6 +175,12 @@ def list_data_files() -> List[Path]:
     files: List[Path] = []
     for path in DATA_DIR.rglob("*"):
         if not path.is_file():
+            continue
+        try:
+            rel = path.relative_to(DATA_DIR)
+            if rel.parts and rel.parts[0] in IGNORED_TOP_LEVEL_DIRS:
+                continue
+        except ValueError:
             continue
         if path.suffix.lower() in SUPPORTED_TEXT_EXTENSIONS or path.suffix.lower() == ".pdf":
             files.append(path)

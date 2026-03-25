@@ -15,10 +15,35 @@ import streamlit as st
 import app
 
 PATH_SETTINGS_FILE = Path(__file__).with_name("path_settings.json")
+LANGUAGE_OPTIONS = [("日本語", "ja"), ("English", "en")]
+LANGUAGE_LABEL_TO_CODE = {label: code for label, code in LANGUAGE_OPTIONS}
+LANGUAGE_CODE_TO_LABEL = {code: label for label, code in LANGUAGE_OPTIONS}
+ENGLISH_DATA_DIRNAME = "en"
 
 
 def _get_upload_cache_dir() -> Path:
     return app.DATA_DIR / "streamlit_uploads"
+
+
+def _build_language_runtime(
+    data_dir: str,
+    chroma_dir: str,
+    language_code: str,
+) -> Tuple[Path, Path, Path, str, set]:
+    data_root = Path(data_dir).expanduser().resolve()
+    chroma_root = Path(chroma_dir).expanduser().resolve()
+    if language_code == "en":
+        data_path = data_root / ENGLISH_DATA_DIRNAME
+        manifest_path = chroma_root / "index_manifest_en.json"
+        collection_name = f"{app.BASE_COLLECTION_NAME}_en"
+        ignored_dirs = set()
+    else:
+        # Keep existing Japanese data/index visible by default.
+        data_path = data_root
+        manifest_path = chroma_root / "index_manifest.json"
+        collection_name = app.BASE_COLLECTION_NAME
+        ignored_dirs = {ENGLISH_DATA_DIRNAME}
+    return data_path, chroma_root, manifest_path, collection_name, ignored_dirs
 
 
 def _load_path_settings() -> Tuple[str, str]:
@@ -60,14 +85,20 @@ def _pick_folder_dialog(initial_dir: str) -> Optional[str]:
         return None
 
 
-def _apply_runtime_paths(data_dir: str, chroma_dir: str) -> Tuple[Path, Path]:
-    data_path = Path(data_dir).expanduser().resolve()
-    chroma_path = Path(chroma_dir).expanduser().resolve()
+def _apply_runtime_paths(data_dir: str, chroma_dir: str, language_code: str) -> Tuple[Path, Path]:
+    data_path, chroma_path, manifest_path, collection_name, ignored_dirs = _build_language_runtime(
+        data_dir,
+        chroma_dir,
+        language_code,
+    )
     data_path.mkdir(parents=True, exist_ok=True)
     chroma_path.mkdir(parents=True, exist_ok=True)
     app.DATA_DIR = data_path
     app.CHROMA_DIR = chroma_path
-    app.MANIFEST_PATH = chroma_path / "index_manifest.json"
+    app.MANIFEST_PATH = manifest_path
+    app.COLLECTION_NAME = collection_name
+    app.ACTIVE_LANGUAGE = language_code
+    app.IGNORED_TOP_LEVEL_DIRS = ignored_dirs
     return data_path, chroma_path
 
 
@@ -81,6 +112,17 @@ def _sha256_bytes(data: bytes) -> str:
 
 def _normalize_key(name: str) -> str:
     return name.replace("\\", "/")
+
+
+def _is_excluded_from_folder_index(root: Path, target: Path) -> bool:
+    ignored_dirs = getattr(app, "IGNORED_TOP_LEVEL_DIRS", set())
+    if not ignored_dirs:
+        return False
+    try:
+        rel = target.relative_to(root)
+    except ValueError:
+        return False
+    return bool(rel.parts) and rel.parts[0] in ignored_dirs
 
 
 def _uploaded_size(uploaded_file) -> int:
@@ -379,7 +421,11 @@ def index_pdf_folder(
     if not root.exists() or not root.is_dir():
         raise FileNotFoundError(f"Folder not found: {root}")
 
-    pdf_files = sorted(p for p in root.rglob("*.pdf") if p.is_file())
+    pdf_files = sorted(
+        p
+        for p in root.rglob("*.pdf")
+        if p.is_file() and not _is_excluded_from_folder_index(root, p)
+    )
     touched = 0
     added = 0
     removed = 0
@@ -578,15 +624,25 @@ def main() -> None:
     st.set_page_config(page_title="Manual PDF RAG", layout="wide")
     st.title("Manual PDF RAG (Chroma Persistent)")
     st.caption("PDFをドラッグ&ドロップ、またはフォルダ指定で一括インデックスできます。")
+    st.sidebar.header("対象言語")
+    active_language_label = st.sidebar.radio(
+        "コーパスを選択",
+        options=[label for label, _ in LANGUAGE_OPTIONS],
+        index=0,
+        key="active_language_label",
+    )
+    active_language_code = LANGUAGE_LABEL_TO_CODE[active_language_label]
+    st.sidebar.caption("選択した言語ごとに、取り込み・検索・管理・登録ファイル一覧を分けて扱います。")
 
     app.ensure_dirs()
-    if "runtime_data_dir" not in st.session_state or "runtime_chroma_dir" not in st.session_state:
+    if "runtime_data_root_dir" not in st.session_state or "runtime_chroma_root_dir" not in st.session_state:
         loaded_data, loaded_chroma = _load_path_settings()
-        st.session_state["runtime_data_dir"] = loaded_data
-        st.session_state["runtime_chroma_dir"] = loaded_chroma
+        st.session_state["runtime_data_root_dir"] = st.session_state.get("runtime_data_dir", loaded_data)
+        st.session_state["runtime_chroma_root_dir"] = st.session_state.get("runtime_chroma_dir", loaded_chroma)
     _apply_runtime_paths(
-        st.session_state["runtime_data_dir"],
-        st.session_state["runtime_chroma_dir"],
+        st.session_state["runtime_data_root_dir"],
+        st.session_state["runtime_chroma_root_dir"],
+        active_language_code,
     )
 
     # 起動時に chroma_db が空なら GitHub から自動復元
@@ -603,6 +659,7 @@ def main() -> None:
 
     with tab_ingest:
         st.subheader("1) PDFドラッグ&ドロップ取り込み")
+        st.caption(f"現在の対象言語: {active_language_label}")
         auto_upload_index = st.checkbox(
             "アップロード後に自動で取り込み開始",
             value=True,
@@ -716,6 +773,7 @@ def main() -> None:
 
     with tab_query:
         st.subheader("類似箇所検索")
+        st.caption(f"現在の対象言語: {active_language_label}")
         indexed_names = get_indexed_file_names()
         st.caption(f"現在の登録ファイル数: {len(indexed_names)}")
         if indexed_names:
@@ -759,36 +817,36 @@ def main() -> None:
 
     with tab_manage:
         st.subheader("インデックス管理")
-        if "manage_data_dir_input" not in st.session_state:
-            st.session_state["manage_data_dir_input"] = st.session_state["runtime_data_dir"]
-        if "manage_chroma_dir_input" not in st.session_state:
-            st.session_state["manage_chroma_dir_input"] = st.session_state["runtime_chroma_dir"]
+        if "manage_data_root_input" not in st.session_state:
+            st.session_state["manage_data_root_input"] = st.session_state["runtime_data_root_dir"]
+        if "manage_chroma_root_input" not in st.session_state:
+            st.session_state["manage_chroma_root_input"] = st.session_state["runtime_chroma_root_dir"]
 
         with st.expander("保存先Path設定", expanded=False):
             data_col1, data_col2 = st.columns([6, 1])
             data_col1.text_input(
-                "DataフォルダPath",
-                key="manage_data_dir_input",
-                help="取り込み対象PDFやアップロード保存先を管理するフォルダ",
+                "DataルートフォルダPath",
+                key="manage_data_root_input",
+                help="言語別データを管理するベースフォルダ。英語は配下の en/ を使用します。",
             )
             if data_col2.button("参照", key="browse_data_dir"):
-                selected = _pick_folder_dialog(st.session_state["manage_data_dir_input"])
+                selected = _pick_folder_dialog(st.session_state["manage_data_root_input"])
                 if selected:
-                    st.session_state["manage_data_dir_input"] = selected
+                    st.session_state["manage_data_root_input"] = selected
                     st.rerun()
                 if os.name != "nt":
                     st.warning("フォルダ選択ダイアログはWindowsのみ対応です。")
 
             chroma_col1, chroma_col2 = st.columns([6, 1])
             chroma_col1.text_input(
-                "ChromaフォルダPath",
-                key="manage_chroma_dir_input",
-                help="ベクトルDBとmanifestを保持するフォルダ",
+                "ChromaルートフォルダPath",
+                key="manage_chroma_root_input",
+                help="日本語・英語の両インデックスを保持するベースフォルダ",
             )
             if chroma_col2.button("参照", key="browse_chroma_dir"):
-                selected = _pick_folder_dialog(st.session_state["manage_chroma_dir_input"])
+                selected = _pick_folder_dialog(st.session_state["manage_chroma_root_input"])
                 if selected:
-                    st.session_state["manage_chroma_dir_input"] = selected
+                    st.session_state["manage_chroma_root_input"] = selected
                     st.rerun()
                 if os.name != "nt":
                     st.warning("フォルダ選択ダイアログはWindowsのみ対応です。")
@@ -796,21 +854,27 @@ def main() -> None:
             if st.button("Pathを適用", use_container_width=True):
                 try:
                     data_path, chroma_path = _apply_runtime_paths(
-                        st.session_state["manage_data_dir_input"],
-                        st.session_state["manage_chroma_dir_input"],
+                        st.session_state["manage_data_root_input"],
+                        st.session_state["manage_chroma_root_input"],
+                        active_language_code,
                     )
-                    st.session_state["runtime_data_dir"] = str(data_path)
-                    st.session_state["runtime_chroma_dir"] = str(chroma_path)
-                    st.session_state["manage_data_dir_input"] = str(data_path)
-                    st.session_state["manage_chroma_dir_input"] = str(chroma_path)
-                    _save_path_settings(str(data_path), str(chroma_path))
+                    st.session_state["runtime_data_root_dir"] = st.session_state["manage_data_root_input"]
+                    st.session_state["runtime_chroma_root_dir"] = st.session_state["manage_chroma_root_input"]
+                    st.session_state["manage_data_root_input"] = st.session_state["runtime_data_root_dir"]
+                    st.session_state["manage_chroma_root_input"] = st.session_state["runtime_chroma_root_dir"]
+                    _save_path_settings(
+                        st.session_state["runtime_data_root_dir"],
+                        st.session_state["runtime_chroma_root_dir"],
+                    )
                     st.success(f"適用しました。data={data_path} / chroma={chroma_path}")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Path適用に失敗しました: {e}")
 
+        st.caption(f"現在の対象言語: {active_language_label}")
         st.caption(f"現在のdata: {app.DATA_DIR}")
-        st.caption(f"現在のchroma: {app.CHROMA_DIR}")
+        st.caption(f"現在のchroma(root): {app.CHROMA_DIR}")
+        st.caption(f"現在のcollection: {app.COLLECTION_NAME}")
         col1, col2 = st.columns(2)
         with col1:
             if st.button("このPathで再インデックス(index)", use_container_width=True):
