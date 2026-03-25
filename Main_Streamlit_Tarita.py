@@ -3,6 +3,7 @@ import io
 import json
 import os
 import base64
+import gc
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -333,9 +334,13 @@ def index_uploaded_pdfs(
                 touched += 1
                 added += a
                 removed += r
+            app.save_manifest(manifest)
+            gc.collect()
             emit(file_start + file_span, f"{uploaded.name}: 完了", touched, added, removed)
         except Exception as e:
             errors.append(f"{uploaded.name}: {e}")
+            app.save_manifest(manifest)
+            gc.collect()
             emit(file_start + file_span, f"{uploaded.name}: エラーのためスキップ", touched, added, removed)
 
     emit(0.97, "結果保存中...", touched, added, removed)
@@ -415,6 +420,8 @@ def index_pdf_folder(
             touched += 1
             added += a
             removed += r
+        app.save_manifest(manifest)
+        gc.collect()
         emit(file_start + file_span, f"{rel}: 完了", touched, added, removed)
 
     emit(0.97, "結果保存中...", touched, added, removed)
