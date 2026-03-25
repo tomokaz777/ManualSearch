@@ -424,25 +424,21 @@ def index_pdf_folder(
 
 
 def run_query(
-    question: str,
+    search_text: str,
     k: int,
-    relevance_threshold: float,
+    min_score: float,
     min_vector_score: float,
     min_lexical_score: float,
     candidate_multiplier: int,
-) -> Tuple[str, List]:
-    docs = app.search_relevant_docs(
-        question,
+) -> List:
+    return app.search_ranked_matches(
+        search_text,
         k=k,
-        relevance_threshold=relevance_threshold,
+        min_score=min_score,
         min_vector_score=min_vector_score,
         min_lexical_score=min_lexical_score,
         candidate_multiplier=candidate_multiplier,
     )
-    if not docs:
-        return "該当情報が見つかりませんでした。", []
-    answer = app.llm_answer(question, docs)
-    return answer, docs
 
 
 def _resolve_source_path(md: Dict) -> Optional[Path]:
@@ -492,7 +488,7 @@ def _render_pdf_inline(path_obj: Path, page: Optional[int] = None) -> None:
 
 def render_sources(docs: List) -> None:
     if not docs:
-        st.write("(なし)")
+        st.info("一致または近い箇所が見つかりませんでした。")
         return
     for idx, d in enumerate(docs):
         md = d.metadata
@@ -502,6 +498,8 @@ def render_sources(docs: List) -> None:
         page = md.get("page_start", md.get("page"))
         page_end = md.get("page_end", page)
         source_path = md.get("source_path")
+        match_type = md.get("match_type", "類似")
+        score = md.get("relevance_score")
         if page is not None and page_end is not None and page_end != page:
             page_text = f"{page}-{page_end}"
         elif page is not None:
@@ -509,14 +507,30 @@ def render_sources(docs: List) -> None:
         else:
             page_text = "(不明)"
 
-        expander_title = f"{idx + 1}. {file_name} / ページ:{page_text} / 行:{start_line}-{end_line}"
+        if score is None:
+            expander_title = f"{idx + 1}. {match_type} / {file_name} / ページ:{page_text} / 行:{start_line}-{end_line}"
+        else:
+            expander_title = (
+                f"{idx + 1}. {match_type} / {file_name} / ページ:{page_text} / "
+                f"行:{start_line}-{end_line} / score:{score}"
+            )
         with st.expander(expander_title, expanded=(idx == 0)):
+            st.markdown(f"- 順位: `{idx + 1}`")
+            st.markdown(f"- 一致種別: `{match_type}`")
             st.markdown(f"- ファイル: `{file_name}`")
             st.markdown(f"- ページ: `{page_text}`")
             st.markdown(f"- 行(ページ内): `{start_line}-{end_line}`")
-            score = md.get("relevance_score")
             if score is not None:
-                st.markdown(f"- 関連度スコア: `{score}`")
+                st.markdown(f"- 最終スコア: `{score}`")
+            vector_score = md.get("vector_score")
+            if vector_score is not None:
+                st.markdown(f"- ベクトル類似度: `{vector_score}`")
+            lexical_score = md.get("lexical_score")
+            if lexical_score is not None:
+                st.markdown(f"- 語彙一致率: `{lexical_score}`")
+            substring_score = md.get("substring_score")
+            if substring_score is not None:
+                st.markdown(f"- 連続一致率: `{substring_score}`")
 
             path_obj = _resolve_source_path(md)
             if path_obj:
@@ -530,7 +544,7 @@ def render_sources(docs: List) -> None:
             else:
                 st.markdown("- ファイルパス: (未記録。再インデックスで改善します)")
 
-            st.markdown("**該当箇所プレビュー（抽出チャンク）**")
+            st.markdown("**該当箇所**")
             st.code(d.page_content.strip() or "(テキストなし)", language="text")
 
 
@@ -689,30 +703,33 @@ def main() -> None:
                 st.error(str(e))
 
     with tab_query:
-        st.subheader("RAG検索")
-        question = st.text_area("質問", height=120, placeholder="例: インストール手順の前提条件は？")
-        k = st.number_input("Top-k", min_value=1, max_value=20, value=app.TOP_K, step=1)
-        with st.expander("関連度フィルタ設定（ノイズ低減）", expanded=False):
-            relevance_threshold = st.slider("最終関連度しきい値", min_value=0.0, max_value=1.0, value=0.35, step=0.01)
-            min_vector_score = st.slider("ベクトル類似度の下限", min_value=0.0, max_value=1.0, value=0.20, step=0.01)
-            min_lexical_score = st.slider("語彙一致率の下限", min_value=0.0, max_value=1.0, value=0.03, step=0.01)
-            candidate_multiplier = st.slider("再評価候補倍率", min_value=1, max_value=10, value=6, step=1)
+        st.subheader("類似箇所検索")
+        search_text = st.text_area(
+            "検索文",
+            height=140,
+            placeholder="例: 探したい文・単語・段落をそのまま入力",
+        )
+        k = st.number_input("表示件数", min_value=1, max_value=30, value=app.TOP_K, step=1)
+        with st.expander("ランキング設定", expanded=False):
+            min_score = st.slider("最終スコアの下限", min_value=0.0, max_value=1.0, value=0.0, step=0.01)
+            min_vector_score = st.slider("ベクトル類似度の下限", min_value=0.0, max_value=1.0, value=0.0, step=0.01)
+            min_lexical_score = st.slider("語彙一致率の下限", min_value=0.0, max_value=1.0, value=0.0, step=0.01)
+            candidate_multiplier = st.slider("ベクトル候補倍率", min_value=1, max_value=10, value=6, step=1)
+        st.caption("厳密一致・空白差異を無視した一致を優先し、その後に類似度順で並べます。")
         st.caption("行はPDF抽出テキストのページ内行番号です（見た目の行とは一致しない場合があります）。")
-        if st.button("検索して回答", use_container_width=True):
-            if not question.strip():
-                st.warning("質問を入力してください。")
+        if st.button("類似箇所を検索", use_container_width=True):
+            if not search_text.strip():
+                st.warning("検索文を入力してください。")
             else:
-                answer, docs = run_query(
-                    question.strip(),
+                docs = run_query(
+                    search_text.strip(),
                     int(k),
-                    relevance_threshold=float(relevance_threshold),
+                    min_score=float(min_score),
                     min_vector_score=float(min_vector_score),
                     min_lexical_score=float(min_lexical_score),
                     candidate_multiplier=int(candidate_multiplier),
                 )
-                st.markdown("### 回答")
-                st.write(answer)
-                st.markdown(f"### 出典（表示: {len(docs)}件）")
+                st.markdown(f"### 検索結果（表示: {len(docs)}件）")
                 render_sources(docs)
 
     with tab_manage:

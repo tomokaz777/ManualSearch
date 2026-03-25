@@ -1,5 +1,6 @@
 import argparse
 import bisect
+from difflib import SequenceMatcher
 import hashlib
 import json
 import os
@@ -477,6 +478,130 @@ def _lexical_overlap_score(question: str, content: str) -> float:
         return 0.0
     overlap = len(q_tokens & c_tokens)
     return overlap / max(len(q_tokens), 1)
+
+
+def _normalize_match_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _compact_match_text(text: str) -> str:
+    return re.sub(r"\s+", "", text).lower()
+
+
+def _longest_common_substring_ratio(query_text: str, content_text: str) -> float:
+    if not query_text or not content_text:
+        return 0.0
+    if query_text in content_text:
+        return 1.0
+    match = SequenceMatcher(None, query_text, content_text, autojunk=False).find_longest_match(
+        0,
+        len(query_text),
+        0,
+        len(content_text),
+    )
+    return match.size / max(len(query_text), 1)
+
+
+def search_ranked_matches(
+    query_text: str,
+    k: int,
+    min_score: float = 0.0,
+    min_vector_score: float = 0.0,
+    min_lexical_score: float = 0.0,
+    candidate_multiplier: int = 6,
+) -> List[Document]:
+    store = get_vector_store()
+    fetched = store.get(include=["documents", "metadatas"])
+    documents = fetched.get("documents") or []
+    metadatas = fetched.get("metadatas") or []
+    ids = fetched.get("ids") or []
+    if not documents:
+        return []
+
+    query_text = query_text.strip()
+    if not query_text:
+        return []
+
+    query_normalized = _normalize_match_text(query_text)
+    query_compact = _compact_match_text(query_text)
+    total_docs = len(documents)
+    multiplier = max(1, int(candidate_multiplier))
+    candidate_k = min(total_docs, max(k, k * multiplier, 50))
+
+    vector_scores: Dict[str, float] = {}
+    try:
+        pairs = store.similarity_search_with_relevance_scores(query_text, k=candidate_k)
+    except Exception:
+        pairs = []
+    for doc, score in pairs:
+        chunk_id = str(doc.metadata.get("chunk_id", ""))
+        if not chunk_id:
+            continue
+        vector_scores[chunk_id] = max(
+            vector_scores.get(chunk_id, 0.0),
+            max(0.0, min(1.0, float(score))),
+        )
+
+    ranked: List[Tuple[float, float, float, float, Document]] = []
+    for idx, content in enumerate(documents):
+        text = str(content or "")
+        if not text.strip():
+            continue
+
+        md = dict(metadatas[idx] or {}) if idx < len(metadatas) else {}
+        chunk_id = str(md.get("chunk_id") or (ids[idx] if idx < len(ids) else f"chunk_{idx}"))
+        md["chunk_id"] = chunk_id
+
+        vector_score = vector_scores.get(chunk_id, 0.0)
+        lexical_score = _lexical_overlap_score(query_text, text)
+        content_normalized = _normalize_match_text(text)
+        content_compact = _compact_match_text(text)
+        substring_score = _longest_common_substring_ratio(query_compact, content_compact)
+
+        exact_match = bool(query_normalized) and query_normalized == content_normalized
+        phrase_match = bool(query_normalized) and query_normalized in content_normalized
+        compact_match = (
+            bool(query_compact)
+            and len(query_compact) >= 2
+            and query_compact in content_compact
+        )
+
+        if exact_match:
+            match_type = "完全一致"
+            final_score = 1.0
+        elif phrase_match:
+            match_type = "部分一致"
+            final_score = min(0.99, 0.95 + 0.03 * substring_score + 0.02 * max(vector_score, lexical_score))
+        elif compact_match:
+            match_type = "空白差異を無視した一致"
+            final_score = min(0.94, 0.90 + 0.05 * substring_score + 0.05 * max(vector_score, lexical_score))
+        else:
+            match_type = "類似"
+            final_score = 0.45 * vector_score + 0.35 * lexical_score + 0.20 * substring_score
+
+        if final_score < min_score:
+            continue
+        if not (exact_match or phrase_match or compact_match):
+            if vector_score < min_vector_score and lexical_score < min_lexical_score:
+                continue
+
+        md["match_type"] = match_type
+        md["vector_score"] = round(vector_score, 4)
+        md["lexical_score"] = round(lexical_score, 4)
+        md["substring_score"] = round(substring_score, 4)
+        md["relevance_score"] = round(final_score, 4)
+        ranked.append(
+            (
+                final_score,
+                substring_score,
+                lexical_score,
+                vector_score,
+                Document(page_content=text, metadata=md),
+            )
+        )
+
+    ranked.sort(key=lambda x: (x[0], x[1], x[2], x[3]), reverse=True)
+    return [doc for _, _, _, _, doc in ranked[:k]]
 
 
 def search_relevant_docs(
