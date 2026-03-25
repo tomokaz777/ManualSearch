@@ -264,16 +264,23 @@ def _upsert_pdf(
 ) -> Tuple[bool, int, int]:
     logical_file_name = _normalize_key(logical_file_name)
     old = manifest_files.get(logical_file_name)
-    changed = (old is None) or (old.get("hash") != file_hash)
+    old_chunk_ids = list(old.get("chunk_ids") or []) if old else []
+    same_hash = old is not None and old.get("hash") == file_hash
+    missing_old_chunks = False
+    if old is not None:
+        if not old_chunk_ids:
+            missing_old_chunks = True
+        else:
+            try:
+                fetched = store.get(ids=old_chunk_ids, include=["metadatas"])
+                existing_ids = {str(chunk_id) for chunk_id in (fetched.get("ids") or [])}
+                missing_old_chunks = len(existing_ids) < len(old_chunk_ids)
+            except Exception:
+                missing_old_chunks = True
+
+    changed = (old is None) or (not same_hash) or missing_old_chunks
     if not changed:
         return False, 0, 0
-
-    removed = 0
-    if old and old.get("chunk_ids"):
-        if stage_cb:
-            stage_cb("既存チャンクを削除中...")
-        app.delete_by_ids(store, old["chunk_ids"])
-        removed = len(old["chunk_ids"])
 
     if stage_cb:
         stage_cb("PDFテキスト抽出中...")
@@ -287,7 +294,17 @@ def _upsert_pdf(
         overlap=app.CHUNK_OVERLAP,
         source_path=str(file_path.resolve()),
     )
+    if not docs:
+        raise RuntimeError("PDFからテキストを抽出できませんでした。画像PDFまたは抽出不能PDFの可能性があります。")
+
     ids = [d.metadata["chunk_id"] for d in docs]
+
+    removed = 0
+    if old_chunk_ids:
+        if stage_cb:
+            stage_cb("既存チャンクを削除中...")
+        app.delete_by_ids(store, old_chunk_ids)
+        removed = len(old_chunk_ids)
 
     if docs:
         if stage_cb:
