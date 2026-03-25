@@ -616,6 +616,71 @@ def get_indexed_file_names() -> List[str]:
     return sorted(manifest.get("files", {}).keys())
 
 
+def _normalize_debug_text(text: str) -> str:
+    return " ".join(str(text or "").lower().split())
+
+
+def _build_debug_hit(md: Dict, text: str, position: int) -> Dict[str, object]:
+    file_name = str(md.get("file_name", "unknown"))
+    page = md.get("page_start", md.get("page"))
+    start_line = md.get("start_line", "?")
+    end_line = md.get("end_line", "?")
+    snippet_start = max(0, position - 80)
+    snippet_end = min(len(text), position + 180)
+    snippet = text[snippet_start:snippet_end].strip()
+    return {
+        "file_name": file_name,
+        "page": page,
+        "start_line": start_line,
+        "end_line": end_line,
+        "snippet": snippet,
+        "chunk_id": str(md.get("chunk_id", "")),
+    }
+
+
+def debug_search_stored_chunks(search_text: str, max_hits: int = 20) -> Dict[str, object]:
+    query_text = search_text.strip()
+    if not query_text:
+        return {
+            "total_chunks": 0,
+            "raw_hits": [],
+            "normalized_hits": [],
+        }
+
+    store = app.get_vector_store()
+    fetched = store.get(include=["documents", "metadatas"])
+    documents = fetched.get("documents") or []
+    metadatas = fetched.get("metadatas") or []
+    raw_hits: List[Dict[str, object]] = []
+    normalized_hits: List[Dict[str, object]] = []
+    raw_hit_ids = set()
+    normalized_query = _normalize_debug_text(query_text)
+
+    for idx, content in enumerate(documents):
+        text = str(content or "")
+        if not text:
+            continue
+        md = dict(metadatas[idx] or {}) if idx < len(metadatas) else {}
+        chunk_id = str(md.get("chunk_id") or f"chunk_{idx}")
+        md["chunk_id"] = chunk_id
+
+        raw_pos = text.find(query_text)
+        if raw_pos >= 0 and len(raw_hits) < max_hits:
+            raw_hits.append(_build_debug_hit(md, text, raw_pos))
+            raw_hit_ids.add(chunk_id)
+
+        normalized_text = _normalize_debug_text(text)
+        normalized_pos = normalized_text.find(normalized_query)
+        if normalized_pos >= 0 and chunk_id not in raw_hit_ids and len(normalized_hits) < max_hits:
+            normalized_hits.append(_build_debug_hit(md, text, 0))
+
+    return {
+        "total_chunks": len(documents),
+        "raw_hits": raw_hits,
+        "normalized_hits": normalized_hits,
+    }
+
+
 def main() -> None:
     st.set_page_config(page_title="Manual PDF RAG", layout="wide")
     st.title("Manual PDF RAG (Chroma Persistent)")
@@ -679,6 +744,51 @@ def main() -> None:
                 st.session_state[sidebar_restore_nonce_key] += 1
                 st.session_state.pop("last_upload_signature", None)
             st.rerun()
+
+    if admin_mode:
+        debug_result_key = f"debug_chunk_search_result_{active_language_code}"
+        st.sidebar.divider()
+        with st.sidebar.expander("デバッグ検索", expanded=False):
+            st.caption("保存済みチャンク全文に対して、生文字列一致と空白正規化一致を確認します。")
+            debug_query = st.text_area(
+                "確認したい文言",
+                height=120,
+                key=f"debug_query_{active_language_code}",
+                placeholder="例: An attempt to release a wafer is made ...",
+            )
+            debug_limit = st.number_input(
+                "表示上限",
+                min_value=1,
+                max_value=50,
+                value=10,
+                step=1,
+                key=f"debug_limit_{active_language_code}",
+            )
+            if st.button("保存済みチャンクを確認", use_container_width=True, key=f"debug_search_button_{active_language_code}"):
+                if not debug_query.strip():
+                    st.sidebar.warning("確認したい文言を入力してください。")
+                else:
+                    result = debug_search_stored_chunks(debug_query.strip(), max_hits=int(debug_limit))
+                    st.session_state[debug_result_key] = result
+            debug_result = st.session_state.get(debug_result_key)
+            if debug_result:
+                st.caption(f"走査チャンク数: {debug_result['total_chunks']}")
+                raw_hits = debug_result["raw_hits"]
+                normalized_hits = debug_result["normalized_hits"]
+                st.caption(f"生文字列一致: {len(raw_hits)} 件")
+                for idx, hit in enumerate(raw_hits, start=1):
+                    page_text = hit["page"] if hit["page"] is not None else "(不明)"
+                    st.markdown(
+                        f"{idx}. `{hit['file_name']}` / p.{page_text} / 行:{hit['start_line']}-{hit['end_line']}"
+                    )
+                    st.code(str(hit["snippet"] or "(スニペットなし)"), language="text")
+                st.caption(f"空白正規化一致: {len(normalized_hits)} 件")
+                for idx, hit in enumerate(normalized_hits, start=1):
+                    page_text = hit["page"] if hit["page"] is not None else "(不明)"
+                    st.markdown(
+                        f"{idx}. `{hit['file_name']}` / p.{page_text} / 行:{hit['start_line']}-{hit['end_line']}"
+                    )
+                    st.code(str(hit["snippet"] or "(スニペットなし)"), language="text")
 
     if admin_mode:
         tab_ingest, tab_query, tab_manage = st.tabs(["取り込み", "検索", "管理"])
