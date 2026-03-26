@@ -1,4 +1,5 @@
 import hashlib
+import html
 import io
 import json
 import os
@@ -108,6 +109,28 @@ def _apply_runtime_paths(data_dir: str, chroma_dir: str, language_code: str) -> 
     app.ACTIVE_LANGUAGE = language_code
     app.IGNORED_TOP_LEVEL_DIRS = ignored_dirs
     return data_path, chroma_path
+
+
+def _render_match_excerpt(text: str) -> None:
+    excerpt = text.strip() or "(テキストなし)"
+    if getattr(app, "ACTIVE_LANGUAGE", "") != "en":
+        st.code(excerpt, language="text")
+        return
+    escaped = html.escape(excerpt)
+    st.markdown(
+        f"""
+        <div style="
+            font-family: 'Times New Roman', Times, serif;
+            white-space: pre-wrap;
+            line-height: 1.65;
+            border: 1px solid rgba(49, 51, 63, 0.2);
+            border-radius: 0.5rem;
+            padding: 0.9rem 1rem;
+            background: rgba(250, 250, 250, 0.9);
+        ">{escaped}</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _utc_now_iso() -> str:
@@ -638,7 +661,7 @@ def render_sources(docs: List) -> None:
                 st.markdown("- ファイルパス: (未記録。再インデックスで改善します)")
 
             st.markdown("**該当箇所**")
-            st.code(d.page_content.strip() or "(テキストなし)", language="text")
+            _render_match_excerpt(d.page_content)
 
 
 def delete_indexed_file(file_name: str) -> int:
@@ -1435,6 +1458,9 @@ def main() -> None:
             st.caption("登録例: " + " / ".join(preview_names))
             if len(indexed_names) > len(preview_names):
                 st.caption(f"ほか {len(indexed_names) - len(preview_names)} 件")
+            with st.expander("読み込み済みファイル一覧", expanded=False):
+                st.caption("現在の対象言語コーパスに登録されているファイル一覧です。")
+                st.code("\n".join(indexed_names), language="text")
         else:
             st.warning(
                 "現在のインデックスに登録ファイルがありません。"
