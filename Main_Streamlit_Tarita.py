@@ -226,7 +226,9 @@ def restore_index_from_local_backup(uploaded_file) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"復元に失敗しました: {e}"
 
-    return True, f"ローカルバックアップを復元しました ({len(zip_bytes) // 1024} KB)"
+    restored_manifest = app.load_manifest()
+    restored_files = len(restored_manifest.get("files", {}))
+    return True, f"ローカルバックアップを復元しました ({len(zip_bytes) // 1024} KB / 登録ファイル数={restored_files})"
 
 
 def clear_server_runtime_data(data_root_dir: str, chroma_root_dir: str) -> Tuple[bool, str]:
@@ -263,7 +265,7 @@ def _upsert_pdf(
     store,
     manifest_files: Dict,
     stage_cb: Optional[Callable[[str], None]] = None,
-) -> Tuple[bool, int, int]:
+) -> Tuple[str, int, int]:
     logical_file_name = _normalize_key(logical_file_name)
     old = manifest_files.get(logical_file_name)
     old_chunk_ids = list(old.get("chunk_ids") or []) if old else []
@@ -282,7 +284,7 @@ def _upsert_pdf(
 
     changed = (old is None) or (not same_hash) or missing_old_chunks
     if not changed:
-        return False, 0, 0
+        return "skipped", 0, 0
 
     if stage_cb:
         stage_cb("PDFテキスト抽出中...")
@@ -318,13 +320,14 @@ def _upsert_pdf(
         "chunk_ids": ids,
         "updated_at": _utc_now_iso(),
     }
-    return True, len(ids), removed
+    action = "added" if old is None else "updated"
+    return action, len(ids), removed
 
 
 def index_uploaded_pdfs(
     uploaded_files,
     progress_cb: Optional[Callable[[float, str, int, int, int], None]] = None,
-) -> Tuple[int, int, int, List[str]]:
+) -> Tuple[int, int, int, List[str], Dict[str, object]]:
     total = max(len(uploaded_files), 1)
 
     def emit(progress: float, text: str, t: int, a: int, r: int) -> None:
@@ -340,11 +343,15 @@ def index_uploaded_pdfs(
     emit(0.15, "インデックス状態の読み込み中...", 0, 0, 0)
     manifest = app.load_manifest()
     manifest_files = manifest.setdefault("files", {})
+    before_file_count = len(manifest_files)
 
     touched = 0
     added = 0
     removed = 0
     errors: List[str] = []
+    added_files: List[str] = []
+    updated_files: List[str] = []
+    skipped_files: List[str] = []
 
     for idx, uploaded in enumerate(uploaded_files, start=1):
         file_start = 0.15 + 0.8 * ((idx - 1) / total)
@@ -379,7 +386,7 @@ def index_uploaded_pdfs(
                 ratio = stage_ratio.get(msg, 0.5)
                 emit(file_start + file_span * ratio, f"{name}: {msg}", touched, added, removed)
 
-            changed, a, r = _upsert_pdf(
+            action, a, r = _upsert_pdf(
                 logical_file_name=logical_name,
                 file_path=save_path,
                 file_hash=file_hash,
@@ -387,10 +394,16 @@ def index_uploaded_pdfs(
                 manifest_files=manifest_files,
                 stage_cb=on_stage if progress_cb else None,
             )
-            if changed:
+            if action != "skipped":
                 touched += 1
                 added += a
                 removed += r
+            if action == "added":
+                added_files.append(logical_name)
+            elif action == "updated":
+                updated_files.append(logical_name)
+            else:
+                skipped_files.append(logical_name)
             app.save_manifest(manifest)
             gc.collect()
             emit(file_start + file_span, f"{uploaded.name}: 完了", touched, added, removed)
@@ -404,7 +417,14 @@ def index_uploaded_pdfs(
     app.save_manifest(manifest)
     final_text = "取り込み完了" if not errors else f"取り込み完了（一部エラー {len(errors)} 件）"
     emit(1.0, final_text, touched, added, removed)
-    return touched, added, removed, errors
+    summary = {
+        "before_file_count": before_file_count,
+        "after_file_count": len(manifest_files),
+        "added_files": added_files,
+        "updated_files": updated_files,
+        "skipped_files": skipped_files,
+    }
+    return touched, added, removed, errors, summary
 
 
 def _uploaded_signature(uploaded_files) -> str:
@@ -1260,6 +1280,20 @@ def main() -> None:
                         removed=prior_upload_result["removed"],
                     )
                 )
+                st.caption(
+                    "登録ファイル数: {before} -> {after} / 追加ファイル={added_files} / 更新ファイル={updated_files} / スキップ={skipped_files}".format(
+                        before=prior_upload_result.get("before_file_count", 0),
+                        after=prior_upload_result.get("after_file_count", 0),
+                        added_files=prior_upload_result.get("added_file_count", 0),
+                        updated_files=prior_upload_result.get("updated_file_count", 0),
+                        skipped_files=prior_upload_result.get("skipped_file_count", 0),
+                    )
+                )
+                if prior_upload_result.get("skipped_file_count", 0):
+                    st.warning("変更なしとしてスキップされたファイルがあります。")
+                    with st.expander("スキップファイル一覧", expanded=False):
+                        for name in prior_upload_result.get("skipped_files", []):
+                            st.write(f"- {name}")
                 if prior_upload_result["errors"]:
                     st.warning(f"失敗ファイル: {len(prior_upload_result['errors'])} 件")
                     with st.expander("失敗ファイル一覧", expanded=False):
@@ -1303,7 +1337,7 @@ def main() -> None:
                     stage_log.caption(f"現在の工程: {message}")
 
                 try:
-                    touched, added, removed, errors = index_uploaded_pdfs(
+                    touched, added, removed, errors, summary = index_uploaded_pdfs(
                         uploaded_files,
                         progress_cb=on_upload_progress,
                     )
@@ -1320,6 +1354,12 @@ def main() -> None:
                     "added": added,
                     "removed": removed,
                     "errors": errors,
+                    "before_file_count": summary.get("before_file_count", 0),
+                    "after_file_count": summary.get("after_file_count", 0),
+                    "added_file_count": len(summary.get("added_files", [])),
+                    "updated_file_count": len(summary.get("updated_files", [])),
+                    "skipped_file_count": len(summary.get("skipped_files", [])),
+                    "skipped_files": summary.get("skipped_files", [])[:20],
                 }
                 st.session_state[uploader_nonce_key] += 1
                 st.session_state.pop("last_upload_signature", None)
