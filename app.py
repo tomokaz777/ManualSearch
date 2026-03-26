@@ -177,6 +177,24 @@ def get_vector_store() -> Chroma:
     )
 
 
+def reset_chroma_system_cache() -> None:
+    try:
+        from chromadb.api.client import SharedSystemClient
+    except Exception:
+        return
+
+    systems = list(getattr(SharedSystemClient, "_identifier_to_system", {}).values())
+    for system in systems:
+        try:
+            system.stop()
+        except Exception:
+            pass
+    try:
+        SharedSystemClient.clear_system_cache()
+    except Exception:
+        pass
+
+
 def list_data_files() -> List[Path]:
     files: List[Path] = []
     for path in DATA_DIR.rglob("*"):

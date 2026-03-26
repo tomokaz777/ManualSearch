@@ -214,6 +214,7 @@ def restore_index_from_local_backup(uploaded_file) -> Tuple[bool, str]:
         return False, "バックアップzipが空です"
 
     try:
+        app.reset_chroma_system_cache()
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             members = [name for name in zf.namelist() if name and not name.endswith("/")]
             if not members:
@@ -221,6 +222,7 @@ def restore_index_from_local_backup(uploaded_file) -> Tuple[bool, str]:
             _remove_tree_contents(app.CHROMA_DIR)
             app.CHROMA_DIR.mkdir(parents=True, exist_ok=True)
             _safe_extract_zip(zf, app.CHROMA_DIR)
+        app.reset_chroma_system_cache()
     except zipfile.BadZipFile:
         return False, "zipファイルとして読み込めませんでした"
     except Exception as e:
@@ -235,6 +237,8 @@ def clear_server_runtime_data(data_root_dir: str, chroma_root_dir: str) -> Tuple
     data_root = Path(data_root_dir).expanduser().resolve()
     chroma_root = Path(chroma_root_dir).expanduser().resolve()
     removed_items = 0
+
+    app.reset_chroma_system_cache()
 
     upload_dirs = [
         data_root / "streamlit_uploads",
@@ -252,6 +256,7 @@ def clear_server_runtime_data(data_root_dir: str, chroma_root_dir: str) -> Tuple
     chroma_root.mkdir(parents=True, exist_ok=True)
     app.ensure_dirs()
     app.save_manifest({"files": {}})
+    app.reset_chroma_system_cache()
     return True, f"サーバー上データを削除しました (削除対象={removed_items}件)"
 
 
