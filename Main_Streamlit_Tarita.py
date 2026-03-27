@@ -166,6 +166,28 @@ def _uploaded_size(uploaded_file) -> int:
         return len(uploaded_file.getvalue() or b"")
 
 
+def _parse_pdf_password_candidates(raw_text: str) -> List[str]:
+    candidates: List[str] = []
+    for line in str(raw_text or "").splitlines():
+        password = line.strip()
+        if password and password not in candidates:
+            candidates.append(password)
+    return candidates
+
+
+def _verify_chroma_chunk_ids(store, chunk_ids: List[str]) -> None:
+    if not chunk_ids:
+        return
+    try:
+        fetched = store.get(ids=chunk_ids, include=["metadatas"])
+    except Exception as e:
+        raise RuntimeError(f"Chroma保存確認に失敗しました: {e}") from e
+    existing_ids = {str(chunk_id) for chunk_id in (fetched.get("ids") or [])}
+    if len(existing_ids) < len(chunk_ids):
+        missing = len(chunk_ids) - len(existing_ids)
+        raise RuntimeError(f"Chroma保存確認に失敗しました。{missing} 件のチャンクが見つかりません。")
+
+
 # ── ローカルバックアップ / サーバー上データ削除 ─────────────────────────────
 
 
@@ -293,6 +315,7 @@ def _upsert_pdf(
     store,
     manifest_files: Dict,
     stage_cb: Optional[Callable[[str], None]] = None,
+    pdf_password_candidates: Optional[List[str]] = None,
 ) -> Tuple[str, int, int]:
     logical_file_name = _normalize_key(logical_file_name)
     old = manifest_files.get(logical_file_name)
@@ -316,7 +339,7 @@ def _upsert_pdf(
 
     if stage_cb:
         stage_cb("PDFテキスト抽出中...")
-    content = app.read_pdf(file_path)
+    content = app.read_pdf(file_path, passwords=pdf_password_candidates)
     if stage_cb:
         stage_cb("チャンク分割中...")
     docs = app.split_with_metadata(
@@ -342,6 +365,9 @@ def _upsert_pdf(
         if stage_cb:
             stage_cb("ベクトル化してChromaへ保存中...")
         store.add_documents(docs, ids=ids)
+        if stage_cb:
+            stage_cb("Chroma保存確認中...")
+        _verify_chroma_chunk_ids(store, ids)
 
     manifest_files[logical_file_name] = {
         "hash": file_hash,
@@ -355,6 +381,7 @@ def _upsert_pdf(
 def index_uploaded_pdfs(
     uploaded_files,
     progress_cb: Optional[Callable[[float, str, int, int, int], None]] = None,
+    pdf_password_candidates: Optional[List[str]] = None,
 ) -> Tuple[int, int, int, List[str], Dict[str, object]]:
     total = max(len(uploaded_files), 1)
 
@@ -408,6 +435,7 @@ def index_uploaded_pdfs(
                 "PDFテキスト抽出中...": 0.45,
                 "チャンク分割中...": 0.70,
                 "ベクトル化してChromaへ保存中...": 0.90,
+                "Chroma保存確認中...": 0.96,
             }
 
             def on_stage(msg: str, name: str = uploaded.name) -> None:
@@ -421,6 +449,7 @@ def index_uploaded_pdfs(
                 store=store,
                 manifest_files=manifest_files,
                 stage_cb=on_stage if progress_cb else None,
+                pdf_password_candidates=pdf_password_candidates,
             )
             if action != "skipped":
                 touched += 1
@@ -467,6 +496,7 @@ def _uploaded_signature(uploaded_files) -> str:
 def index_pdf_folder(
     folder_path: str,
     progress_cb: Optional[Callable[[float, str, int, int, int], None]] = None,
+    pdf_password_candidates: Optional[List[str]] = None,
 ) -> Tuple[int, int, int, int]:
     def emit(progress: float, text: str, t: int, a: int, r: int) -> None:
         if progress_cb:
@@ -511,6 +541,7 @@ def index_pdf_folder(
             "PDFテキスト抽出中...": 0.45,
             "チャンク分割中...": 0.70,
             "ベクトル化してChromaへ保存中...": 0.90,
+            "Chroma保存確認中...": 0.96,
         }
 
         def on_stage(msg: str, rel_name: str = rel) -> None:
@@ -524,6 +555,7 @@ def index_pdf_folder(
             store=store,
             manifest_files=manifest_files,
             stage_cb=on_stage if progress_cb else None,
+            pdf_password_candidates=pdf_password_candidates,
         )
         if changed:
             touched += 1
@@ -745,6 +777,55 @@ def debug_search_stored_chunks(search_text: str, max_hits: int = 20) -> Dict[str
         "total_chunks": len(documents),
         "raw_hits": raw_hits,
         "normalized_hits": normalized_hits,
+    }
+
+
+def get_indexed_file_chunk_stats() -> Dict[str, object]:
+    manifest = app.load_manifest()
+    manifest_files = manifest.get("files", {})
+    store = app.get_vector_store()
+    fetched = store.get(include=["metadatas"])
+    metadatas = fetched.get("metadatas") or []
+
+    chroma_counts: Dict[str, int] = {}
+    for md in metadatas:
+        file_name = str((md or {}).get("file_name", "")).strip()
+        if not file_name:
+            continue
+        chroma_counts[file_name] = chroma_counts.get(file_name, 0) + 1
+
+    all_names = sorted(set(manifest_files.keys()) | set(chroma_counts.keys()))
+    rows: List[Dict[str, object]] = []
+    for file_name in all_names:
+        manifest_chunk_ids = list((manifest_files.get(file_name) or {}).get("chunk_ids") or [])
+        manifest_chunks = len(manifest_chunk_ids)
+        chroma_chunks = int(chroma_counts.get(file_name, 0))
+        if manifest_chunks == chroma_chunks and chroma_chunks > 0:
+            status = "OK"
+        elif manifest_chunks == 0 and chroma_chunks == 0:
+            status = "未登録"
+        elif chroma_chunks == 0:
+            status = "Chroma未保存"
+        elif manifest_chunks == 0:
+            status = "Manifest未登録"
+        else:
+            status = "不一致"
+        rows.append(
+            {
+                "status": status,
+                "file_name": file_name,
+                "manifest_chunks": manifest_chunks,
+                "chroma_chunks": chroma_chunks,
+            }
+        )
+
+    return {
+        "rows": rows,
+        "manifest_file_count": len(manifest_files),
+        "chroma_file_count": len(chroma_counts),
+        "chroma_chunk_total": sum(chroma_counts.values()),
+        "ok_files": sum(1 for row in rows if row["status"] == "OK"),
+        "problem_files": sum(1 for row in rows if row["status"] != "OK"),
     }
 
 
@@ -1128,6 +1209,28 @@ def main() -> None:
         debug_result_key = f"debug_chunk_search_result_{active_language_code}"
         evaluation_result_key = f"evaluation_result_{active_language_code}"
         st.sidebar.divider()
+        with st.sidebar.expander("登録ファイル確認", expanded=False):
+            st.caption("manifest件数とChroma実チャンク数をファイル単位で確認します。")
+            file_stats = get_indexed_file_chunk_stats()
+            st.caption(
+                "manifest登録ファイル数: {manifest_count} / Chroma実ファイル数: {chroma_count} / "
+                "Chroma実チャンク総数: {chunk_total}".format(
+                    manifest_count=file_stats["manifest_file_count"],
+                    chroma_count=file_stats["chroma_file_count"],
+                    chunk_total=file_stats["chroma_chunk_total"],
+                )
+            )
+            st.caption(
+                "OKファイル: {ok_files} / 要確認ファイル: {problem_files}".format(
+                    ok_files=file_stats["ok_files"],
+                    problem_files=file_stats["problem_files"],
+                )
+            )
+            if file_stats["rows"]:
+                st.dataframe(file_stats["rows"], use_container_width=True, hide_index=True)
+            else:
+                st.info("現在のコーパスには確認対象ファイルがありません。")
+
         with st.sidebar.expander("デバッグ検索", expanded=False):
             st.caption("保存済みチャンク全文に対して、生文字列一致と空白正規化一致を確認します。")
             debug_query = st.text_area(
@@ -1332,6 +1435,14 @@ def main() -> None:
                 value=True,
                 help="ONの場合、ドラッグ&ドロップ直後にインデックス処理を開始します。",
             )
+            pdf_password_input = st.text_input(
+                "PDFパスワード（必要な場合のみ）",
+                type="password",
+                key=f"pdf_password_input_{active_language_code}",
+                help="パスワード付きPDFを取り込むときだけ入力します。同じパスワードのPDFをまとめて処理できます。",
+            )
+            pdf_password_candidates = _parse_pdf_password_candidates(pdf_password_input)
+            st.caption("異なるパスワードが混在する場合は、パスワードごとに分けて取り込んでください。")
             uploaded_files = st.file_uploader(
                 "PDFを複数選択またはドラッグ&ドロップ",
                 type=["pdf"],
@@ -1368,6 +1479,7 @@ def main() -> None:
                     touched, added, removed, errors, summary = index_uploaded_pdfs(
                         uploaded_files,
                         progress_cb=on_upload_progress,
+                        pdf_password_candidates=pdf_password_candidates,
                     )
                 except Exception as e:
                     status.empty()
@@ -1439,6 +1551,7 @@ def main() -> None:
                     scanned, touched, added, removed = index_pdf_folder(
                         folder_input,
                         progress_cb=on_folder_progress,
+                        pdf_password_candidates=pdf_password_candidates,
                     )
                     progress.progress(100, text="取り込み完了")
                     status.empty()

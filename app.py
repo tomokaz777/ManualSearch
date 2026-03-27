@@ -211,17 +211,29 @@ def list_data_files() -> List[Path]:
     return sorted(files)
 
 
-def read_pdf(path: Path) -> FileContent:
+def _pdf_password_candidates(passwords: Optional[Iterable[str]] = None) -> List[str]:
+    candidates: List[str] = [""]
+    if not passwords:
+        return candidates
+    for password in passwords:
+        text = str(password or "")
+        if text not in candidates:
+            candidates.append(text)
+    return candidates
+
+
+def read_pdf(path: Path, passwords: Optional[Iterable[str]] = None) -> FileContent:
     candidates: List[Tuple[str, FileContent]] = []
     errors: List[str] = []
+    password_candidates = _pdf_password_candidates(passwords)
 
     try:
-        candidates.append(("pypdf", _read_pdf_with_pypdf(path)))
+        candidates.append(("pypdf", _read_pdf_with_pypdf(path, password_candidates)))
     except Exception as e:
         errors.append(f"pypdf: {e}")
 
     try:
-        candidates.append(("pymupdf", _read_pdf_with_pymupdf(path)))
+        candidates.append(("pymupdf", _read_pdf_with_pymupdf(path, password_candidates)))
     except Exception as e:
         errors.append(f"pymupdf: {e}")
 
@@ -256,30 +268,43 @@ def _build_file_content(page_texts: List[str]) -> FileContent:
     return FileContent(text="".join(full_text_parts), page_ranges=page_ranges, page_texts=page_texts)
 
 
-def _read_pdf_with_pypdf(path: Path) -> FileContent:
+def _read_pdf_with_pypdf(path: Path, passwords: Optional[Iterable[str]] = None) -> FileContent:
     if PdfReader is None:
         raise RuntimeError("pypdf is required to process PDF files.")
     reader = PdfReader(str(path))
     if getattr(reader, "is_encrypted", False):
-        try:
-            reader.decrypt("")
-        except Exception:
-            pass
+        unlocked = False
+        for password in _pdf_password_candidates(passwords):
+            try:
+                if reader.decrypt(password):
+                    unlocked = True
+                    break
+            except Exception:
+                continue
+        if not unlocked:
+            raise RuntimeError("PDFを開くための正しいパスワードが必要です。")
     page_texts: List[str] = []
     for page in reader.pages:
         page_texts.append(_normalize_extracted_text(page.extract_text() or ""))
     return _build_file_content(page_texts)
 
 
-def _read_pdf_with_pymupdf(path: Path) -> FileContent:
+def _read_pdf_with_pymupdf(path: Path, passwords: Optional[Iterable[str]] = None) -> FileContent:
     if fitz is None:
         raise RuntimeError("PyMuPDF is not available.")
     doc = fitz.open(str(path))
     try:
         if getattr(doc, "needs_pass", 0):
-            auth = doc.authenticate("")
-            if not auth:
-                raise RuntimeError("PDFを開くためのパスワードが必要です。")
+            unlocked = False
+            for password in _pdf_password_candidates(passwords):
+                try:
+                    if doc.authenticate(password):
+                        unlocked = True
+                        break
+                except Exception:
+                    continue
+            if not unlocked:
+                raise RuntimeError("PDFを開くための正しいパスワードが必要です。")
         page_texts = [_normalize_extracted_text(page.get_text("text") or "") for page in doc]
     finally:
         doc.close()
