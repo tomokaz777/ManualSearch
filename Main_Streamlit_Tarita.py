@@ -9,7 +9,9 @@ import gc
 import re
 import zipfile
 import shutil
+import unicodedata
 from datetime import UTC, datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -111,16 +113,78 @@ def _apply_runtime_paths(data_dir: str, chroma_dir: str, language_code: str) -> 
     return data_path, chroma_path
 
 
-def _render_match_excerpt(text: str) -> None:
+def _build_compact_highlight_text(text: str) -> Tuple[str, List[int]]:
+    compact_chars: List[str] = []
+    index_map: List[int] = []
+    for idx, ch in enumerate(str(text or "")):
+        normalized = unicodedata.normalize("NFKC", ch).lower()
+        for norm_ch in normalized:
+            if re.fullmatch(r"[A-Za-z0-9ぁ-んァ-ン一-龯ー]", norm_ch):
+                compact_chars.append(norm_ch)
+                index_map.append(idx)
+    return "".join(compact_chars), index_map
+
+
+def _find_highlight_span(text: str, query_text: str) -> Optional[Tuple[int, int]]:
+    source_text = str(text or "")
+    query = str(query_text or "").strip()
+    if not source_text or not query:
+        return None
+
+    lower_source = source_text.lower()
+    lower_query = query.lower()
+    raw_pos = lower_source.find(lower_query)
+    if raw_pos >= 0:
+        return raw_pos, raw_pos + len(query)
+
+    compact_source, source_map = _build_compact_highlight_text(source_text)
+    compact_query, _ = _build_compact_highlight_text(query)
+    if not compact_source or not compact_query or not source_map:
+        return None
+
+    compact_pos = compact_source.find(compact_query)
+    if compact_pos >= 0:
+        start = source_map[compact_pos]
+        end = source_map[compact_pos + len(compact_query) - 1] + 1
+        return start, end
+
+    match = SequenceMatcher(None, compact_query, compact_source, autojunk=False).find_longest_match(
+        0,
+        len(compact_query),
+        0,
+        len(compact_source),
+    )
+    min_size = 2 if len(compact_query) <= 6 else max(4, len(compact_query) // 3)
+    if match.size < min_size:
+        return None
+    start = source_map[match.b]
+    end = source_map[match.b + match.size - 1] + 1
+    return start, end
+
+
+def _render_match_excerpt(text: str, query_text: str = "") -> None:
     excerpt = text.strip() or "(テキストなし)"
-    if getattr(app, "ACTIVE_LANGUAGE", "") != "en":
-        st.code(excerpt, language="text")
-        return
-    escaped = html.escape(excerpt)
+    highlight_span = _find_highlight_span(excerpt, query_text)
+    if highlight_span:
+        start, end = highlight_span
+        escaped = (
+            html.escape(excerpt[:start])
+            + '<mark style="background:#ffe98a; padding:0 0.1rem; border-radius:0.2rem;">'
+            + html.escape(excerpt[start:end])
+            + "</mark>"
+            + html.escape(excerpt[end:])
+        )
+    else:
+        escaped = html.escape(excerpt)
+
+    if getattr(app, "ACTIVE_LANGUAGE", "") == "en":
+        font_family = "'Times New Roman', Times, serif"
+    else:
+        font_family = "'Yu Gothic UI', 'Meiryo', sans-serif"
     st.markdown(
         f"""
         <div style="
-            font-family: 'Times New Roman', Times, serif;
+            font-family: {font_family};
             white-space: pre-wrap;
             line-height: 1.65;
             border: 1px solid rgba(49, 51, 63, 0.2);
@@ -634,7 +698,7 @@ def _render_pdf_inline(path_obj: Path, page: Optional[int] = None) -> None:
     st.components.v1.html(iframe, height=720, scrolling=True)
 
 
-def render_sources(docs: List) -> None:
+def render_sources(docs: List, query_text: str = "") -> None:
     if not docs:
         st.info("一致または近い箇所が見つかりませんでした。")
         return
@@ -693,7 +757,7 @@ def render_sources(docs: List) -> None:
                 st.markdown("- ファイルパス: (未記録。再インデックスで改善します)")
 
             st.markdown("**該当箇所**")
-            _render_match_excerpt(d.page_content)
+            _render_match_excerpt(d.page_content, query_text=query_text)
 
 
 def delete_indexed_file(file_name: str) -> int:
@@ -1605,7 +1669,7 @@ def main() -> None:
                     candidate_multiplier=int(candidate_multiplier),
                 )
                 st.markdown(f"### 検索結果（表示: {len(docs)}件）")
-                render_sources(docs)
+                render_sources(docs, query_text=search_text.strip())
 
     if admin_mode:
         with tab_manage:
