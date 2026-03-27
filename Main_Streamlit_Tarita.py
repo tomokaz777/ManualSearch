@@ -1660,14 +1660,18 @@ def main() -> None:
             if not search_text.strip():
                 st.warning("検索文を入力してください。")
             else:
-                docs = run_query(
-                    search_text.strip(),
-                    int(k),
-                    min_score=float(min_score),
-                    min_vector_score=float(min_vector_score),
-                    min_lexical_score=float(min_lexical_score),
-                    candidate_multiplier=int(candidate_multiplier),
-                )
+                with st.spinner("検索中です... Streamlit Cloud で照合しています。"):
+                    search_status = st.empty()
+                    search_status.info("検索中です。結果が出るまでそのままお待ちください。")
+                    docs = run_query(
+                        search_text.strip(),
+                        int(k),
+                        min_score=float(min_score),
+                        min_vector_score=float(min_vector_score),
+                        min_lexical_score=float(min_lexical_score),
+                        candidate_multiplier=int(candidate_multiplier),
+                    )
+                    search_status.empty()
                 st.markdown(f"### 検索結果（表示: {len(docs)}件）")
                 render_sources(docs, query_text=search_text.strip())
 
