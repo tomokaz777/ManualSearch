@@ -10,12 +10,16 @@ import re
 import zipfile
 import shutil
 import unicodedata
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 import streamlit as st
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:  # pragma: no cover - optional runtime dependency
+    st_autorefresh = None
 
 import app
 
@@ -25,6 +29,8 @@ LANGUAGE_LABEL_TO_CODE = {label: code for label, code in LANGUAGE_OPTIONS}
 LANGUAGE_CODE_TO_LABEL = {code: label for label, code in LANGUAGE_OPTIONS}
 ENGLISH_DATA_DIRNAME = "en"
 DEFAULT_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "manual_rag")
+AUTO_CLEAR_TIMEOUT_MINUTES = int(os.getenv("AUTO_CLEAR_TIMEOUT_MINUTES", "10"))
+AUTO_CLEAR_REFRESH_MS = 60 * 1000
 
 
 def _get_upload_cache_dir() -> Path:
@@ -370,6 +376,77 @@ def clear_server_runtime_data(data_root_dir: str, chroma_root_dir: str) -> Tuple
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _auto_clear_state_path(chroma_root_dir: str) -> Path:
+    return Path(chroma_root_dir).expanduser().resolve() / ".auto_clear_state.json"
+
+
+def _server_runtime_has_data(data_root_dir: str, chroma_root_dir: str) -> bool:
+    chroma_root = Path(chroma_root_dir).expanduser().resolve()
+    if chroma_root.exists():
+        for path in chroma_root.rglob("*"):
+            if path.is_file() and path.name != ".auto_clear_state.json":
+                return True
+    data_root = Path(data_root_dir).expanduser().resolve()
+    for upload_dir in [
+        data_root / "streamlit_uploads",
+        data_root / ENGLISH_DATA_DIRNAME / "streamlit_uploads",
+    ]:
+        if upload_dir.exists() and any(path.is_file() for path in upload_dir.rglob("*")):
+            return True
+    return False
+
+
+def _record_server_activity(data_root_dir: str, chroma_root_dir: str, reason: str) -> None:
+    if not _server_runtime_has_data(data_root_dir, chroma_root_dir):
+        return
+    state_path = _auto_clear_state_path(chroma_root_dir)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "last_activity_at": datetime.now(UTC).isoformat(),
+        "reason": reason,
+    }
+    state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_last_server_activity(chroma_root_dir: str) -> Optional[datetime]:
+    state_path = _auto_clear_state_path(chroma_root_dir)
+    if not state_path.exists():
+        return None
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        raw_value = str(payload.get("last_activity_at", "")).strip()
+        if not raw_value:
+            return None
+        return datetime.fromisoformat(raw_value)
+    except Exception:
+        return None
+
+
+def _maybe_auto_clear_server_data(data_root_dir: str, chroma_root_dir: str) -> Optional[str]:
+    if not _server_runtime_has_data(data_root_dir, chroma_root_dir):
+        return None
+    last_activity = _load_last_server_activity(chroma_root_dir)
+    if last_activity is None:
+        return None
+    if datetime.now(UTC) - last_activity < timedelta(minutes=AUTO_CLEAR_TIMEOUT_MINUTES):
+        return None
+    ok, msg = clear_server_runtime_data(data_root_dir, chroma_root_dir)
+    if not ok:
+        return f"無操作タイムアウト削除に失敗しました: {msg}"
+    return f"最後の操作から {AUTO_CLEAR_TIMEOUT_MINUTES} 分を超えたため、サーバー上データを自動削除しました。 {msg}"
+
+
+def _clear_after_backup_download(data_root_dir: str, chroma_root_dir: str, feedback_key: str, cache_keys: List[str]) -> None:
+    ok, msg = clear_server_runtime_data(data_root_dir, chroma_root_dir)
+    for key in cache_keys:
+        st.session_state.pop(key, None)
+    st.session_state.pop("last_upload_signature", None)
+    if ok:
+        st.session_state[feedback_key] = f"バックアップ保存後にサーバー上データを自動削除しました。{msg}"
+    else:
+        st.session_state[feedback_key] = f"バックアップ保存後の自動削除に失敗しました: {msg}"
 
 
 def _upsert_pdf(
@@ -1206,8 +1283,8 @@ def run_evaluation_cases(
 
 
 def main() -> None:
-    st.set_page_config(page_title="Manual PDF RAG", layout="wide")
-    st.title("Manual PDF RAG (Chroma Persistent)")
+    st.set_page_config(page_title="Luigi（類似マニュアル検索）", layout="wide")
+    st.title("Luigi（類似マニュアル検索）")
     st.caption("PDFをドラッグ&ドロップ、またはフォルダ指定で一括インデックスできます。")
     st.sidebar.header("対象言語")
     language_options = ["選択してください"] + [label for label, _ in LANGUAGE_OPTIONS]
@@ -1237,13 +1314,29 @@ def main() -> None:
         st.session_state["runtime_chroma_root_dir"],
         active_language_code,
     )
+    auto_clear_feedback_key = f"auto_clear_feedback_{active_language_code}"
+    auto_clear_feedback = st.session_state.pop(auto_clear_feedback_key, None)
+    auto_clear_message = _maybe_auto_clear_server_data(
+        st.session_state["runtime_data_root_dir"],
+        st.session_state["runtime_chroma_root_dir"],
+    )
+    if auto_clear_message:
+        auto_clear_feedback = auto_clear_message
+    if st_autorefresh and _server_runtime_has_data(
+        st.session_state["runtime_data_root_dir"],
+        st.session_state["runtime_chroma_root_dir"],
+    ):
+        st_autorefresh(interval=AUTO_CLEAR_REFRESH_MS, key=f"auto_clear_refresh_{active_language_code}")
 
     sidebar_restore_result_key = f"sidebar_restore_result_{active_language_code}"
     sidebar_restore_nonce_key = f"sidebar_restore_nonce_{active_language_code}"
     if sidebar_restore_nonce_key not in st.session_state:
         st.session_state[sidebar_restore_nonce_key] = 0
     restore_feedback = st.session_state.pop(sidebar_restore_result_key, None)
+    if auto_clear_feedback:
+        st.sidebar.warning(auto_clear_feedback)
     st.sidebar.divider()
+    st.sidebar.caption(f"無操作 {AUTO_CLEAR_TIMEOUT_MINUTES} 分でサーバー上データを自動削除します。")
     st.sidebar.subheader("検索データ読込")
     st.sidebar.caption("ローカル保存したバックアップzipを復元してから検索します。")
     if restore_feedback:
@@ -1265,6 +1358,11 @@ def main() -> None:
                 ok, msg = restore_index_from_local_backup(sidebar_backup_zip)
             st.session_state[sidebar_restore_result_key] = {"ok": ok, "msg": msg}
             if ok:
+                _record_server_activity(
+                    st.session_state["runtime_data_root_dir"],
+                    st.session_state["runtime_chroma_root_dir"],
+                    "sidebar_restore",
+                )
                 st.session_state[sidebar_restore_nonce_key] += 1
                 st.session_state.pop("last_upload_signature", None)
             st.rerun()
@@ -1565,6 +1663,11 @@ def main() -> None:
                     "skipped_file_count": len(summary.get("skipped_files", [])),
                     "skipped_files": summary.get("skipped_files", [])[:20],
                 }
+                _record_server_activity(
+                    st.session_state["runtime_data_root_dir"],
+                    st.session_state["runtime_chroma_root_dir"],
+                    "uploaded_indexing",
+                )
                 st.session_state[uploader_nonce_key] += 1
                 st.session_state.pop("last_upload_signature", None)
                 st.rerun()
@@ -1619,6 +1722,11 @@ def main() -> None:
                     )
                     progress.progress(100, text="取り込み完了")
                     status.empty()
+                    _record_server_activity(
+                        st.session_state["runtime_data_root_dir"],
+                        st.session_state["runtime_chroma_root_dir"],
+                        "folder_indexing",
+                    )
                     st.success(
                         f"走査PDF={scanned}, 更新ファイル={touched}, 追加チャンク={added}, 置換削除チャンク={removed}"
                     )
@@ -1670,6 +1778,11 @@ def main() -> None:
                         min_vector_score=float(min_vector_score),
                         min_lexical_score=float(min_lexical_score),
                         candidate_multiplier=int(candidate_multiplier),
+                    )
+                    _record_server_activity(
+                        st.session_state["runtime_data_root_dir"],
+                        st.session_state["runtime_chroma_root_dir"],
+                        "search",
                     )
                     search_status.empty()
                 st.markdown(f"### 検索結果（表示: {len(docs)}件）")
@@ -1793,6 +1906,13 @@ def main() -> None:
                         file_name=backup_name,
                         mime="application/zip",
                         use_container_width=True,
+                        on_click=_clear_after_backup_download,
+                        args=(
+                            st.session_state["runtime_data_root_dir"],
+                            st.session_state["runtime_chroma_root_dir"],
+                            auto_clear_feedback_key,
+                            [local_backup_bytes_key, local_backup_name_key],
+                        ),
                     )
                 else:
                     st.caption("まず『バックアップzipを準備』を押してください。")
@@ -1811,6 +1931,11 @@ def main() -> None:
                             ok, msg = restore_index_from_local_backup(restore_zip)
                         st.session_state[local_restore_result_key] = {"ok": ok, "msg": msg}
                         if ok:
+                            _record_server_activity(
+                                st.session_state["runtime_data_root_dir"],
+                                st.session_state["runtime_chroma_root_dir"],
+                                "manage_restore",
+                            )
                             st.session_state[local_restore_nonce_key] += 1
                             st.session_state.pop("last_upload_signature", None)
                         st.rerun()

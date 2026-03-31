@@ -10,4 +10,5 @@ cryptography
 pycryptodome
 python-dotenv
 streamlit
+streamlit-autorefresh
 requests
