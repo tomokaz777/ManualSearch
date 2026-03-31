@@ -31,6 +31,7 @@ ENGLISH_DATA_DIRNAME = "en"
 DEFAULT_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "manual_rag")
 AUTO_CLEAR_TIMEOUT_MINUTES = int(os.getenv("AUTO_CLEAR_TIMEOUT_MINUTES", "10"))
 AUTO_CLEAR_REFRESH_MS = 60 * 1000
+LUIGI_IMAGE_PATH = Path(__file__).with_name("Luigi.png")
 
 
 def _get_upload_cache_dir() -> Path:
@@ -1284,7 +1285,12 @@ def run_evaluation_cases(
 
 def main() -> None:
     st.set_page_config(page_title="Luigi（類似マニュアル検索）", layout="wide")
-    st.title("Luigi（類似マニュアル検索）")
+    title_image_col, title_text_col = st.columns([2, 8], gap="small")
+    with title_image_col:
+        if LUIGI_IMAGE_PATH.exists():
+            st.image(str(LUIGI_IMAGE_PATH), width=550)
+    with title_text_col:
+        st.title("Luigi（類似マニュアル検索）")
     st.caption("PDFをドラッグ&ドロップ、またはフォルダ指定で一括インデックスできます。")
     st.sidebar.header("対象言語")
     language_options = ["選択してください"] + [label for label, _ in LANGUAGE_OPTIONS]
